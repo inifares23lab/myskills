@@ -20,8 +20,9 @@ tool's config, it is pulled from the skill's own source at install time.
 | ponytail    | always on | `DietrichGebert/ponytail` plugin | none — hooks itself            |
 | i-have-adhd | always on | `ayghri/i-have-adhd` plugin      | flag files, and Codex AGENTS.md |
 | learn       | on demand | `learnkit` repo                  | none                           |
-| visual      | on demand | `visual-docs` repo               | none                           |
-| openspec    | on demand | `@fission-ai/openspec` on npm    | none — per project             |
+| visual           | on demand | `visual-docs` repo                   | none                           |
+| visual-explainer | on demand | `nicobailon/visual-explainer` plugin | none — the tree is the skill   |
+| openspec         | on demand | `@fission-ai/openspec` on npm        | global skills + commands, generated once |
 
 `learnkit` and `visual-docs` are cloned shallow into a temp dir, run, and thrown
 away. A repo that will not clone fails by name and the rest still install.
@@ -76,9 +77,11 @@ codex exec --skip-git-repo-check 'name the skills in your context'
 opencode run 'name the skills in your context'
 ```
 
-Nothing tells an agent that `openspec` exists. Its commands are generated per
-project by `openspec init`, so in a repo without an `openspec/` directory the
-CLI is on PATH and unmentioned.
+`openspec` is the one skill generated rather than installed: `openspec init` in
+a throwaway project produces the skill and command trees, which are copied into
+the tool homes — so every session sees `/opsx:*`. The specs and changes
+themselves stay per project: `openspec init` in a repo writes only that repo's
+`openspec/` directory.
 
 ## Switches
 

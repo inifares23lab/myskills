@@ -147,16 +147,69 @@ if d=$(clone https://github.com/inifares23lab/learnkit.git); then run "$d/instal
 echo "visual"
 if d=$(clone https://github.com/inifares23lab/visual-docs.git); then run "$d/install.sh"; fi
 
+# --- visual-explainer -------------------------------------------------------------
+# Self-contained HTML visual explanations — diagrams, decks, diff and plan
+# reviews, project recaps. A whole plugin tree per tool home, the way its own
+# installer ships it; its command templates join the opencode command dir.
+echo "visual-explainer"
+if d=$(clone https://github.com/nicobailon/visual-explainer.git); then
+	src="$d/plugins/visual-explainer"
+	if [ -f "$src/SKILL.md" ]; then
+		for home in "$HOME/.claude/skills" "$HOME/.opencode/skills" "$codex_home/skills"; do
+			rm -rf "$home/visual-explainer"
+			mkdir -p "$home"
+			cp -R "$src" "$home/visual-explainer"
+		done
+		mkdir -p "$oc_home/command"
+		if cp -R "$src"/commands/*.md "$oc_home/command/" 2>/dev/null; then
+			echo "  skill for opencode, claude, codex + opencode commands"
+		else
+			echo "  skill for opencode, claude, codex"
+		fi
+	else
+		echo "  [FAIL] visual-explainer — no SKILL.md in the plugin tree"
+	fi
+fi
+
 # --- openspec ---------------------------------------------------------------------
-# Spec-driven change, /opsx:*. An npm CLI that generates its own commands per
-# project, so the global half is just having it on PATH.
+# Spec-driven change, /opsx:*. Two halves. The CLI on PATH does the work; the
+# skill and command files are generated once into the tool homes, so every
+# session sees /opsx:* — while specs and changes stay per project, in each
+# repo's own openspec/.
 echo "openspec"
 if have openspec; then
-	echo "  already installed — $(openspec --version 2>/dev/null || echo present)"
+	echo "  present — $(openspec --version 2>/dev/null || echo yes)"
 elif have npm; then
 	npm install -g @fission-ai/openspec@latest >/dev/null 2>&1 &&
 		echo "  installed" || echo "  [FAIL] npm install -g @fission-ai/openspec@latest"
 else
 	echo "  [skip] no npm"
+fi
+if have openspec && have git; then
+	# Generated in a throwaway project: only the .opencode/.claude/.agents trees
+	# belong on the machine, and the scratch openspec/ dies with it. Stale
+	# openspec-* files go first, so a workflow removed upstream does not linger.
+	opsx=$(mktemp -d)
+	git init -q "$opsx" 2>/dev/null || true
+	if (cd "$opsx" && openspec init --tools opencode,claude,codex \
+			--no-copilot-cloud --no-animation >/dev/null 2>&1); then
+		for d in "$HOME/.opencode/skills" "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+			mkdir -p "$d"
+			rm -rf "$d"/openspec-*
+		done
+		cp -R "$opsx/.opencode/skills/." "$HOME/.opencode/skills/"
+		cp -R "$opsx/.claude/skills/." "$HOME/.claude/skills/"
+		cp -R "$opsx/.agents/skills/." "$HOME/.agents/skills/"
+		mkdir -p "$oc_home/command"
+		rm -f "$oc_home/command"/opsx-*.md
+		cp -R "$opsx/.opencode/commands/." "$oc_home/command/"
+		mkdir -p "$HOME/.claude/commands"
+		rm -rf "$HOME/.claude/commands/opsx"
+		cp -R "$opsx/.claude/commands/." "$HOME/.claude/commands/"
+		echo "  skills + commands for opencode, claude, codex"
+	else
+		echo "  [FAIL] openspec init — global skills not generated"
+	fi
+	rm -rf "$opsx"
 fi
 echo "  per project: openspec init"
