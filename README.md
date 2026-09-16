@@ -19,8 +19,8 @@ tool's config, it is pulled from the skill's own source at install time.
 | ----------- | --------- | -------------------------------- | ------------------------------ |
 | ponytail    | always on | `DietrichGebert/ponytail` plugin | none — hooks itself            |
 | i-have-adhd | always on | `ayghri/i-have-adhd` plugin      | flag files, and Codex AGENTS.md |
-| learn       | on demand | `learnkit` repo                  | none                           |
-| visual           | on demand | `visual-docs` repo                   | none                           |
+| learn       | on demand | `learnkit` repo                  | always-on plugin               |
+| visual      | on demand | `visual-docs` repo               | always-on plugin               |
 | visual-explainer | on demand | `nicobailon/visual-explainer` plugin | none — the tree is the skill   |
 | openspec         | on demand | `@fission-ai/openspec` on npm        | global skills + commands, generated once |
 
@@ -91,17 +91,25 @@ Independent, so turning one off leaves the others running.
 | ----------- | ---------------- | ----------------------------- |
 | i-have-adhd | `stop adhd mode` | `adhd mode` or `/i-have-adhd` |
 | ponytail    | `stop ponytail`  | `/ponytail lite\|full\|ultra` |
-| visual      | `no diagrams`    | `/visual`                     |
+| learn       | `stop learn mode` | `/learn` or `learn mode`     |
+| visual      | `no diagrams`    | `/visual` or `diagrams on`    |
 
-Conversational — they last the session. To turn i-have-adhd off for good, delete
-its flag file rather than saying it every session.
+Conversational — they last the session. Each of learn and visual has one more
+state: `learn always` / `visual always` touches
+`~/.config/opencode/.learn-always` / `.visual-always`, and its plugin injects
+the full body into every new session while the file exists; `learn never` /
+`visual never` removes it. To turn i-have-adhd off for good, delete its flag
+file rather than saying it every session — learn and visual are the same, plus
+the conversational switch.
 
 ## Uninstall
 
 ```sh
-rm -f ~/.claude/.i-have-adhd-always ~/.config/opencode/.i-have-adhd-always
+rm -f ~/.claude/.i-have-adhd-always ~/.config/opencode/.i-have-adhd-always \
+      ~/.config/opencode/.learn-always ~/.config/opencode/.visual-always
 sed -i '/<!-- myskills:.*:start -->/,/<!-- myskills:.*:end -->/d' ~/.codex/AGENTS.md
-rm -rf ~/.config/opencode/vendor/i-have-adhd
+rm -rf ~/.config/opencode/vendor/i-have-adhd \
+       ~/.config/opencode/vendor/learn ~/.config/opencode/vendor/visual
 ```
 
 Then the plugins through their own tools: `claude plugin uninstall`, `codex

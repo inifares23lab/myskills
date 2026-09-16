@@ -138,14 +138,31 @@ if have opencode && have jq; then
 fi
 
 # --- learn ----------------------------------------------------------------------
-# Guided exploration, /learn. Installs itself to all three; on demand, no wiring.
+# Guided exploration, /learn. Installs itself to all three; on demand, no wiring
+# beyond the always-on plugin its installer vendored — the path goes into
+# opencode.json here, since this file owns that config. The mode itself is off
+# until /learn or "learn always".
 echo "learn"
-if d=$(clone https://github.com/inifares23lab/learnkit.git); then run "$d/install.sh"; fi
+if d=$(clone https://github.com/inifares23lab/learnkit.git); then
+	run "$d/install.sh"
+	mjs=$oc_home/vendor/learn/learn.mjs
+	if have jq && [ -f "$mjs" ]; then
+		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
+		echo "  opencode always-on plugin"
+	fi
+fi
 
 # --- visual ---------------------------------------------------------------------
 # Figures in text documents, /visual. Same shape as learn.
 echo "visual"
-if d=$(clone https://github.com/inifares23lab/visual-docs.git); then run "$d/install.sh"; fi
+if d=$(clone https://github.com/inifares23lab/visual-docs.git); then
+	run "$d/install.sh"
+	mjs=$oc_home/vendor/visual/visual.mjs
+	if have jq && [ -f "$mjs" ]; then
+		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
+		echo "  opencode always-on plugin"
+	fi
+fi
 
 # --- visual-explainer -------------------------------------------------------------
 # Self-contained HTML visual explanations — diagrams, decks, diff and plan
