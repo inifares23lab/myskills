@@ -188,6 +188,35 @@ if d=$(clone https://github.com/nicobailon/visual-explainer.git); then
 	fi
 fi
 
+# --- typesafe-ai ------------------------------------------------------------------
+# Build with TypeSafe/Jev: structured decisions (choice/score/noul) as API
+# primitives. Claude gets the upstream plugin; opencode and codex get the skill
+# directory straight from the upstream clone. No wiring and no always-on flag:
+# it is a pure skill the agent reaches for when a task calls for it. One install
+# path per tool — claude never also gets the copied directory, so its plugin and
+# a stale copy can never disagree.
+echo "typesafe-ai"
+if have claude; then
+	claude plugin marketplace add typesafe-ai/skills >/dev/null 2>&1 || true
+	claude plugin install typesafe@typesafe-ai >/dev/null 2>&1 || true
+	claude plugin list 2>/dev/null | grep -q typesafe &&
+		echo "  claude plugin" ||
+		echo "  [FAIL] claude — claude plugin install typesafe@typesafe-ai"
+fi
+if d=$(clone https://github.com/typesafe-ai/skills.git); then
+	src="$d/skills/typesafe-ai"
+	if [ -f "$src/SKILL.md" ]; then
+		for home in "$HOME/.opencode/skills" "$codex_home/skills"; do
+			rm -rf "$home/typesafe-ai"
+			mkdir -p "$home"
+			cp -R "$src" "$home/typesafe-ai"
+		done
+		echo "  skill for opencode, codex"
+	else
+		echo "  [FAIL] typesafe-ai — no SKILL.md in the clone"
+	fi
+fi
+
 # --- openspec ---------------------------------------------------------------------
 # Spec-driven change, /opsx:*. Two halves. The CLI on PATH does the work; the
 # skill and command files are generated once into the tool homes, so every
