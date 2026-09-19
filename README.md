@@ -15,10 +15,29 @@ block in `install.sh`, shaped however that skill happens to work.
 No agent-facing markdown lives here. Where something has to be written into a
 tool's config, it is pulled from the skill's own source at install time.
 
+## Where skills live
+
+One plain copy of each non-plugin skill, in `~/.agents/skills` — the generic
+home that both Codex (USER scope) and OpenCode read. Claude reads only its own
+directory, so it keeps a copy in `~/.claude/skills`; that dir is claude-specific
+and never duplicates work: OpenCode dedupes by name and reads it too.
+
+Skills that ship as plugins (ponytail, i-have-adhd, typesafe-ai) have no plain
+copy anywhere — the plugin is the copy, and OpenCode loads skills bundled with
+its plugins, npm or path. `~/.codex/skills` and `~/.opencode/skills` are legacy:
+no current tool reads them, and `install.sh` clears its skills out.
+
+| Location           | Read by                    | Gets                                                     |
+| ------------------ | -------------------------- | -------------------------------------------------------- |
+| `~/.agents/skills` | codex, opencode            | learn, visual, visual-explainer, openspec-*, typesafe-ai |
+| `~/.claude/skills` | claude (opencode dedupes)  | same set as `~/.agents/skills`                           |
+| plugins            | per-tool                   | ponytail (+ its five sub-skills), i-have-adhd, typesafe-ai |
+
+
 | Skill       | Default   | Comes from                       | Extra here                     |
 | ----------- | --------- | -------------------------------- | ------------------------------ |
-| ponytail    | always on | `DietrichGebert/ponytail` plugin | none — hooks itself            |
-| i-have-adhd | always on | `ayghri/i-have-adhd` plugin      | flag files, and Codex AGENTS.md |
+| ponytail    | always on | `DietrichGebert/ponytail` plugin, `@dietrichgebert/ponytail` on npm for opencode | none — hooks itself |
+| i-have-adhd | always on | `ayghri/i-have-adhd` plugin      | flag files only                 |
 | learn       | on demand | `learnkit` repo                  | always-on plugin               |
 | visual      | on demand | `visual-docs` repo               | always-on plugin               |
 | visual-explainer | on demand | `nicobailon/visual-explainer` plugin | none — the tree is the skill   |
@@ -52,20 +71,22 @@ reads `~/.claude/.i-have-adhd-always`; an OpenCode server plugin
 | ----------- | ------------------------------------------------------ |
 | Claude Code | plugin + `~/.claude/.i-have-adhd-always`               |
 | OpenCode    | vendored plugin + `~/.config/opencode/.i-have-adhd-always` |
-| Codex       | plugin for `$i-have-adhd`, plus a region in `~/.codex/AGENTS.md` |
+| Codex       | plugin, whose bundled `SessionStart` hook reads the same `~/.claude/.i-have-adhd-always` |
 
-Codex is the one that needs help: upstream has no Codex hook, only a snippet to
-paste. So `install.sh` clones upstream and writes the same `SKILL.md` body the
-Claude hook injects into a `<!-- myskills:i-have-adhd:start -->` region. A
-re-run refreshes it; the two flag-file tools need nothing.
+Codex's plugin ships `hooks/hooks.json`, so all three get the always-on ruleset
+from upstream's own mechanisms. An earlier layout pasted the `SKILL.md` body
+into a `<!-- myskills:i-have-adhd -->` region of `~/.codex/AGENTS.md`; the
+plugin hook made that redundant, and `install.sh` deletes the stale region.
 
 OpenCode is also the one exception to throwaway clones — it loads a plugin from
 a path, so that checkout persists at `~/.config/opencode/vendor/i-have-adhd` and
-is `git pull`ed on re-runs.
+is `git pull`ed on re-runs. ponytail needs no checkout: opencode installs the
+npm package itself.
 
-**Codex needs one manual step for ponytail.** Codex will not run a plugin's
-hooks until they are trusted. Open `codex`, run `/hooks`, trust ponytail's two.
-Until then Codex has everything except ponytail's ladder.
+**Codex needs one manual step per hooking plugin.** Codex will not run a
+plugin's hooks until they are trusted. Open `codex`, run `/hooks`, trust
+ponytail's two and i-have-adhd's one. Until then Codex has the skills but not
+the always-on injection.
 
 Verified with a fresh session per tool — Codex answers `ponytail, i-have-adhd`;
 Claude Code and OpenCode add `learn, visual`, whose descriptions they surface
@@ -78,10 +99,10 @@ opencode run 'name the skills in your context'
 ```
 
 `openspec` is the one skill generated rather than installed: `openspec init` in
-a throwaway project produces the skill and command trees, which are copied into
-the tool homes — so every session sees `/opsx:*`. The specs and changes
-themselves stay per project: `openspec init` in a repo writes only that repo's
-`openspec/` directory.
+a throwaway project produces the skill and command trees, copied into
+`~/.agents/skills` and `~/.claude/skills` — so every session sees `/opsx:*`.
+The specs and changes themselves stay per project: `openspec init` in a repo
+writes only that repo's `openspec/` directory.
 
 ## Switches
 
@@ -107,9 +128,10 @@ the conversational switch.
 ```sh
 rm -f ~/.claude/.i-have-adhd-always ~/.config/opencode/.i-have-adhd-always \
       ~/.config/opencode/.learn-always ~/.config/opencode/.visual-always
-sed -i '/<!-- myskills:.*:start -->/,/<!-- myskills:.*:end -->/d' ~/.codex/AGENTS.md
 rm -rf ~/.config/opencode/vendor/i-have-adhd \
        ~/.config/opencode/vendor/learn ~/.config/opencode/vendor/visual
+rm -rf ~/.agents/skills/{learn,visual,visual-explainer,openspec-*,typesafe-ai} \
+       ~/.claude/skills/{learn,visual,visual-explainer,openspec-*,typesafe-ai}
 ```
 
 Then the plugins through their own tools: `claude plugin uninstall`, `codex

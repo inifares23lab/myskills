@@ -7,9 +7,11 @@
 # the list, plus whatever wiring each one needs on top of its own installer. A
 # new skill gets a new block, shaped however that skill happens to work.
 #
-# No agent-facing markdown lives here, and nothing is copied: where a skill has
-# to be always on, the wiring points at the file the skill's own installer
-# already wrote. Idempotent. Only tools on PATH get touched.
+# No agent-facing markdown lives here. Plain skill copies go to ~/.agents/skills,
+# which codex and opencode both read; claude is the exception and gets
+# ~/.claude/skills copies, since it does not read ~/.agents/skills. Where a
+# skill ships as a plugin, the plugin is the only copy. Idempotent. Only tools
+# on PATH get touched.
 set -eu
 
 codex_home=${CODEX_HOME:-$HOME/.codex}
@@ -33,22 +35,6 @@ clone() {
 	fi
 }
 
-# mark <file> <name> <text> — replace this skill's region, append if absent.
-# Per-skill markers, so one skill's wiring never disturbs another's.
-mark() {
-	f=$1
-	mkdir -p "$(dirname "$f")"
-	: >>"$f"
-	sed "/^<!-- myskills:$2:start -->\$/,/^<!-- myskills:$2:end -->\$/d" "$f" >"$f.tmp"
-	{
-		cat "$f.tmp"
-		echo "<!-- myskills:$2:start -->"
-		printf '%s\n' "$3"
-		echo "<!-- myskills:$2:end -->"
-	} >"$f"
-	rm -f "$f.tmp"
-}
-
 oc_json() { # <filter> [jq args...]
 	f=$oc_home/opencode.json
 	filter=$1
@@ -58,15 +44,32 @@ oc_json() { # <filter> [jq args...]
 	jq "$@" "$filter" "$f" >"$f.tmp" && mv "$f.tmp" "$f"
 }
 
-# body <file> — a SKILL.md minus its YAML frontmatter. Frontmatter is for the
-# command loader; in a global instruction file a bare `description:` line reads
-# as an instruction.
-body() { awk '/^---$/{c++; next} c>=2' "$1"; }
+# share <name> — leave one plain copy of a skill, in ~/.agents/skills, which
+# both codex and opencode read. Source: whichever per-tool copy an installer
+# just wrote. The per-tool copies in $codex_home/skills and ~/.opencode/skills
+# are then removed — neither tool reads them anymore. ~/.claude/skills keeps
+# its copy: claude is the one tool that does not read ~/.agents/skills.
+share() {
+	for s in "$HOME/.claude/skills/$1" "$codex_home/skills/$1" "$HOME/.opencode/skills/$1"; do
+		if [ -d "$s" ]; then
+			rm -rf "$HOME/.agents/skills/$1"
+			mkdir -p "$HOME/.agents/skills"
+			cp -R "$s" "$HOME/.agents/skills/$1"
+			break
+		fi
+	done
+	rm -rf "$codex_home/skills/$1" "$HOME/.opencode/skills/$1"
+	if [ -d "$HOME/.agents/skills/$1" ]; then
+		echo "  shared: ~/.agents/skills/$1 (codex, opencode)"
+	fi
+}
 
 # --- ponytail -----------------------------------------------------------------
 # Lazy senior dev mode. Ships its own plugin per tool, with intensity levels, a
 # statusline and /ponytail-* commands, and injects its ruleset through a
 # SessionStart hook — so there is nothing here to wire and nothing to copy.
+# Claude and Codex install it from its marketplace; OpenCode takes the npm
+# package, which bundles the opencode plugin and the skills.
 echo "ponytail"
 if have claude; then
 	claude plugin marketplace add DietrichGebert/ponytail >/dev/null 2>&1 || true
@@ -82,18 +85,25 @@ if have codex; then
 		echo "  codex plugin — trust its two hooks once in /hooks" ||
 		echo "  [FAIL] codex — a 'ponytail' marketplace from another source blocks it; codex plugin marketplace remove ponytail, then re-run"
 fi
-mjs=$HOME/.claude/plugins/marketplaces/ponytail/.opencode/plugins/ponytail.mjs
-if have opencode && have jq && [ -f "$mjs" ]; then
-	oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
-	echo "  opencode plugin"
+if have opencode && have jq; then
+	# One config line, no checkouts and no raw skill copies: opencode installs
+	# npm plugins itself and loads the skills bundled in the package.
+	oc_json '.plugin = (((.plugin // []) | map(select((test("ponytail[.]mjs$") or test("@dietrichgebert/ponytail")) | not))) + ["@dietrichgebert/ponytail"])'
+	echo "  opencode plugin (@dietrichgebert/ponytail from npm)"
 fi
+# Old per-tool copies from earlier layouts: every tool now gets ponytail
+# through a plugin.
+rm -rf "$codex_home/skills/ponytail" "$HOME/.opencode/skills/ponytail" \
+	"$HOME/.claude/skills/ponytail" "$oc_home/skills/ponytail"
 
 # --- i-have-adhd ---------------------------------------------------------------
 # Output shaping. Upstream ships a plugin for each of these three and its own
-# always-on mechanism, so none of this is hand-rolled — Claude and OpenCode watch
-# for a flag file and inject the ruleset themselves. Codex has no such hook
-# upstream, only a snippet to paste, so its AGENTS.md gets the same SKILL.md body
-# the Claude hook injects, from a clone, in a region this script owns.
+# always-on mechanism, so none of this is hand-rolled — Claude and OpenCode
+# watch for a flag file and inject the ruleset themselves. Codex's plugin
+# bundles the same SessionStart hook, gated on the same
+# ~/.claude/.i-have-adhd-always flag Claude uses — it just has to be trusted
+# once in /hooks. An earlier layout pasted the body into ~/.codex/AGENTS.md;
+# that region is removed here.
 adhd=https://github.com/ayghri/i-have-adhd.git
 echo "i-have-adhd"
 if have claude; then
@@ -109,12 +119,17 @@ fi
 if have codex; then
 	codex plugin marketplace add ayghri/i-have-adhd --ref main >/dev/null 2>&1 || true
 	codex plugin add i-have-adhd@i-have-adhd >/dev/null 2>&1 || true
-	codex plugin list 2>/dev/null | grep -q '^i-have-adhd@i-have-adhd' &&
-		echo "  codex plugin — \$i-have-adhd" ||
+	if codex plugin list 2>/dev/null | grep -q '^i-have-adhd@i-have-adhd'; then
+		touch "$HOME/.claude/.i-have-adhd-always"
+		echo "  codex plugin — trust its SessionStart hook once in /hooks; always on via ~/.claude/.i-have-adhd-always"
+	else
 		echo "  [FAIL] codex — codex plugin add i-have-adhd@i-have-adhd"
-	if d=$(clone "$adhd"); then
-		mark "$codex_home/AGENTS.md" i-have-adhd "$(body "$d/skills/i-have-adhd/SKILL.md")"
-		echo "  codex — always on via ~/.codex/AGENTS.md"
+	fi
+	# Migration from the AGENTS.md-region layout this script once owned.
+	ag=$codex_home/AGENTS.md
+	if [ -f "$ag" ] && grep -q 'myskills:i-have-adhd' "$ag"; then
+		sed '/^<!-- myskills:i-have-adhd:start -->$/,/^<!-- myskills:i-have-adhd:end -->$/d' "$ag" >"$ag.tmp" &&
+			mv "$ag.tmp" "$ag"
 	fi
 fi
 if have opencode && have jq; then
@@ -136,6 +151,10 @@ if have opencode && have jq; then
 		echo "  [FAIL] opencode — cannot vendor $adhd to $vend"
 	fi
 fi
+# Old per-tool copies from earlier layouts. OpenCode loads skills bundled with
+# plugins — npm or path — so it needs no raw copies at all.
+rm -rf "$codex_home/skills/i-have-adhd" "$HOME/.opencode/skills/i-have-adhd" \
+	"$HOME/.claude/skills/i-have-adhd" "$oc_home/skills/i-have-adhd"
 
 # --- learn ----------------------------------------------------------------------
 # Guided exploration, /learn. Installs itself to all three; on demand, no wiring
@@ -145,6 +164,7 @@ fi
 echo "learn"
 if d=$(clone https://github.com/inifares23lab/learnkit.git); then
 	run "$d/install.sh"
+	share learn
 	mjs=$oc_home/vendor/learn/learn.mjs
 	if have jq && [ -f "$mjs" ]; then
 		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
@@ -157,6 +177,7 @@ fi
 echo "visual"
 if d=$(clone https://github.com/inifares23lab/visual-docs.git); then
 	run "$d/install.sh"
+	share visual
 	mjs=$oc_home/vendor/visual/visual.mjs
 	if have jq && [ -f "$mjs" ]; then
 		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
@@ -172,16 +193,16 @@ echo "visual-explainer"
 if d=$(clone https://github.com/nicobailon/visual-explainer.git); then
 	src="$d/plugins/visual-explainer"
 	if [ -f "$src/SKILL.md" ]; then
-		for home in "$HOME/.claude/skills" "$HOME/.opencode/skills" "$codex_home/skills"; do
+		for home in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
 			rm -rf "$home/visual-explainer"
 			mkdir -p "$home"
 			cp -R "$src" "$home/visual-explainer"
 		done
 		mkdir -p "$oc_home/command"
 		if cp -R "$src"/commands/*.md "$oc_home/command/" 2>/dev/null; then
-			echo "  skill for opencode, claude, codex + opencode commands"
+			echo "  skill for claude + ~/.agents (codex, opencode) + opencode commands"
 		else
-			echo "  skill for opencode, claude, codex"
+			echo "  skill for claude + ~/.agents (codex, opencode)"
 		fi
 	else
 		echo "  [FAIL] visual-explainer — no SKILL.md in the plugin tree"
@@ -190,11 +211,11 @@ fi
 
 # --- typesafe-ai ------------------------------------------------------------------
 # Build with TypeSafe/Jev: structured decisions (choice/score/noul) as API
-# primitives. Claude gets the upstream plugin; opencode and codex get the skill
-# directory straight from the upstream clone. No wiring and no always-on flag:
-# it is a pure skill the agent reaches for when a task calls for it. One install
-# path per tool — claude never also gets the copied directory, so its plugin and
-# a stale copy can never disagree.
+# primitives. Claude gets the upstream plugin; the one plain copy goes to
+# ~/.agents/skills, which codex and opencode both read. No wiring and no
+# always-on flag: it is a pure skill the agent reaches for when a task calls
+# for it. One install path per tool — claude never also gets the copied
+# directory, so its plugin and a stale copy can never disagree.
 echo "typesafe-ai"
 if have claude; then
 	claude plugin marketplace add typesafe-ai/skills >/dev/null 2>&1 || true
@@ -206,12 +227,11 @@ fi
 if d=$(clone https://github.com/typesafe-ai/skills.git); then
 	src="$d/skills/typesafe-ai"
 	if [ -f "$src/SKILL.md" ]; then
-		for home in "$HOME/.opencode/skills" "$codex_home/skills"; do
-			rm -rf "$home/typesafe-ai"
-			mkdir -p "$home"
-			cp -R "$src" "$home/typesafe-ai"
-		done
-		echo "  skill for opencode, codex"
+		rm -rf "$HOME/.agents/skills/typesafe-ai" \
+			"$HOME/.opencode/skills/typesafe-ai" "$codex_home/skills/typesafe-ai"
+		mkdir -p "$HOME/.agents/skills"
+		cp -R "$src" "$HOME/.agents/skills/typesafe-ai"
+		echo "  skill in ~/.agents/skills (codex, opencode)"
 	else
 		echo "  [FAIL] typesafe-ai — no SKILL.md in the clone"
 	fi
@@ -232,20 +252,20 @@ else
 	echo "  [skip] no npm"
 fi
 if have openspec && have git; then
-	# Generated in a throwaway project: only the .opencode/.claude/.agents trees
-	# belong on the machine, and the scratch openspec/ dies with it. Stale
+	# Generated in a throwaway project: only the .claude/.agents trees belong on
+	# the machine — .agents is the shared home codex and opencode both read,
+	# .claude the copy claude needs. The scratch openspec/ dies with it. Stale
 	# openspec-* files go first, so a workflow removed upstream does not linger.
 	opsx=$(mktemp -d)
 	git init -q "$opsx" 2>/dev/null || true
 	if (cd "$opsx" && openspec init --tools opencode,claude,codex \
 			--no-copilot-cloud --no-animation >/dev/null 2>&1); then
-		for d in "$HOME/.opencode/skills" "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+		for d in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
 			mkdir -p "$d"
 			rm -rf "$d"/openspec-*
 		done
-		cp -R "$opsx/.opencode/skills/." "$HOME/.opencode/skills/"
-		cp -R "$opsx/.claude/skills/." "$HOME/.claude/skills/"
 		cp -R "$opsx/.agents/skills/." "$HOME/.agents/skills/"
+		cp -R "$opsx/.claude/skills/." "$HOME/.claude/skills/"
 		mkdir -p "$oc_home/command"
 		rm -f "$oc_home/command"/opsx-*.md
 		cp -R "$opsx/.opencode/commands/." "$oc_home/command/"
