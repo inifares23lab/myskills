@@ -1,0 +1,24 @@
+# Vendor manifest — one line per vendored upstream source.
+#
+#   <name>  <type>  <url>  <ref>
+#
+#   type npm — <pkg> <ref>; ref is an exact version, a dist-tag such as
+#              latest, or a range. The resolved version is recorded.
+#   type git — <url> <ref>; ref is a branch, a tag (annotated tags are peeled
+#              to their commit), or latest — the newest tag by version sort,
+#              falling back to HEAD when the repo tags nothing. The resolved
+#              commit is recorded either way.
+#
+# refresh.sh reads this file and refreshes vendor/<name>/ only. It never
+# applies patches, never touches patches/ or the live system.
+#
+# Pin deliberately: openspec's generated skills/commands snapshots were
+# produced by the CLI version named in its ref — bump that ref and regenerate
+# the snapshots together.
+ponytail		npm	@dietrichgebert/ponytail	4.10.0
+i-have-adhd	git	https://github.com/ayghri/i-have-adhd.git	main
+learn			git	https://github.com/inifares23lab/learnkit.git	main
+visual			git	https://github.com/inifares23lab/visual-docs.git	main
+visual-explainer	git	https://github.com/nicobailon/visual-explainer.git	main
+typesafe-ai	git	https://github.com/typesafe-ai/skills.git	main
+openspec		npm	@fission-ai/openspec	1.13.1

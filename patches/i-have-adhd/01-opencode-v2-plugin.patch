@@ -1,0 +1,122 @@
+diff --git a/.opencode/plugins/i-have-adhd.mjs b/.opencode/plugins/i-have-adhd.mjs
+index 310b263..b50d9be 100644
+--- a/.opencode/plugins/i-have-adhd.mjs
++++ b/.opencode/plugins/i-have-adhd.mjs
+@@ -1,10 +1,12 @@
+-// i-have-adhd — OpenCode plugin.
++// i-have-adhd — OpenCode plugin (OpenCode 2 plugin API).
+ //
+ // Mirrors the Claude Code / Codex behaviour for OpenCode: the skill in
+ // `skills/i-have-adhd/SKILL.md` is the single source of truth for the ruleset.
+ //
+-//   • On demand   — registers the skills directory and a `/i-have-adhd`
+-//                   command so the ruleset applies for the rest of the session.
++//   • On demand   — registers the `/i-have-adhd` command; the skill itself is
++//                   discovered natively (install.sh copies skills/i-have-adhd
++//                   into the opencode skills dir — v2 has no config mutation
++//                   hook to add skill paths).
+ //   • Always-on   — when the opt-in flag file exists, the full ruleset is
+ //                   appended to the system prompt every turn (the OpenCode
+ //                   equivalent of the SessionStart hook in hooks/always-on.sh).
+@@ -12,8 +14,22 @@
+ // Opt in to always-on:   touch ~/.config/opencode/.i-have-adhd-always
+ // Opt back out:          rm ~/.config/opencode/.i-have-adhd-always
+ //
+-// Install — add to opencode.json:
+-//   { "plugin": ["./.opencode/plugins/i-have-adhd.mjs"] }
++// Install — add the package directory to opencode.json:
++//   { "plugins": ["<path-to-this-package>"] }
++//
++// Ported from the v1 plugin API to the v2 API, verified against OpenCode
++// 2.0.11:
++//   • config hook (skills.paths + command map)
++//                                     → ctx.skill registration moves to native
++//                                       discovery; the command moves to
++//                                       ctx.command.transform
++//   • experimental.chat.system.transform
++//                                     → ctx.session.hook("context"), pushing a
++//                                       { type: "text" } block
++//
++// This file is a patched copy. The pristine upstream version lives in
++// vendor/upstream/i-have-adhd, and the port as a patch series in
++// vendor/patches/i-have-adhd.
+ 
+ import fs from 'fs';
+ import os from 'os';
+@@ -26,8 +42,8 @@ const skillPath = path.join(skillsDir, 'i-have-adhd', 'SKILL.md');
+ const commandPath = path.join(__dirname, '..', 'command', 'i-have-adhd.md');
+ 
+ // JSON is valid YAML frontmatter; share native command metadata without a YAML dependency.
+-async function commandDefinition() {
+-  const raw = await fs.promises.readFile(commandPath, 'utf8');
++function commandDefinition() {
++  const raw = fs.readFileSync(commandPath, 'utf8');
+   const match = raw.match(/^---[^\S\r\n]*\r?\n([\s\S]*?)\r?\n---[^\S\r\n]*(?:\r?\n|$)([\s\S]*)$/);
+   if (!match) throw new Error('Missing command frontmatter');
+   return { ...JSON.parse(match[1]), template: match[2].trim() };
+@@ -51,31 +67,30 @@ function rulesetBody() {
+     .replace(/(?:\r?\n)+$/, '');
+ }
+ 
+-export default async () => {
+-  return {
+-    // Make the skill discoverable (so the `skill` tool and the /i-have-adhd
+-    // command can load it).
+-    config: async (config) => {
+-      config.skills = config.skills || {};
+-      config.skills.paths = config.skills.paths || [];
+-      if (!config.skills.paths.includes(skillsDir)) config.skills.paths.push(skillsDir);
++export default {
++  id: 'i-have-adhd',
+ 
+-      // Global installs need a command entry; preserve native or user-defined commands.
+-      try {
+-        config.command = config.command || {};
+-        if (!config.command['i-have-adhd']) {
+-          config.command['i-have-adhd'] = await commandDefinition();
+-        }
+-      } catch (e) {
+-        // Missing or malformed command files must not break skill discovery.
+-      }
+-    },
++  async setup(ctx) {
++    // Global installs need a command entry; preserve native or user-defined
++    // commands by registering under our own name only.
++    try {
++      const def = commandDefinition();
++      await ctx.command.transform((editor) => {
++        editor.add({
++          name: 'i-have-adhd',
++          description: def.description,
++          template: def.template,
++        });
++      });
++    } catch (e) {
++      // Missing or malformed command files must not break always-on.
++    }
+ 
+     // Always-on: append the ruleset to the system prompt every turn while the
+     // flag file exists. "stop adhd mode" turns it off for the session (the
+     // model honours the skill's own Persistence rules); deleting the flag
+     // turns always-on off for good.
+-    'experimental.chat.system.transform': async (_input, output) => {
++    await ctx.session.hook('context', (event) => {
+       let on = false;
+       try { on = fs.existsSync(flagPath); } catch (e) {}
+       if (!on) return;
+@@ -89,11 +104,8 @@ export default async () => {
+         'session; delete ' + flagPath + ' to turn always-on off for good.';
+       const injected = header + '\n\n' + body;
+ 
+-      if (output.system.length > 0) {
+-        output.system[output.system.length - 1] += '\n\n' + injected;
+-      } else {
+-        output.system.push(injected);
+-      }
+-    },
+-  };
++      if (!event || !Array.isArray(event.system)) return;
++      event.system.push({ type: 'text', text: injected });
++    });
++  },
+ };

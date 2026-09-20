@@ -1,0 +1,168 @@
+diff --git a/.opencode/plugins/ponytail.mjs b/.opencode/plugins/ponytail.mjs
+index aa165bd..7859ca6 100644
+--- a/.opencode/plugins/ponytail.mjs
++++ b/.opencode/plugins/ponytail.mjs
+@@ -1,13 +1,31 @@
+-// ponytail — OpenCode plugin.
++// ponytail — OpenCode plugin (OpenCode 2 plugin API).
+ //
+ // Injects the ponytail ruleset into every chat's system prompt at the active
+-// intensity, persists /ponytail mode switches, and registers slash commands so
+-// they work when the package is installed from npm. Reuses the shared
+-// instruction builder so Claude Code, Codex, pi, and OpenCode all read one
+-// source of truth.
++// intensity, persists /ponytail mode switches, and registers the /ponytail-*
++// slash commands. Reuses the shared instruction builder so Claude Code, Codex,
++// pi, and OpenCode all read one source of truth.
+ //
+-// OpenCode loads this as a server plugin — add it to your opencode.json:
+-//   { "plugin": ["@dietrichgebert/ponytail"] }
++// OpenCode 2 loads this as a server plugin — add the package directory to your
++// opencode.json:
++//   { "plugins": ["<path-to-this-package>"] }
++//
++// Ported from the v1 plugin API (default function returning string-keyed
++// hooks) to the v2 API (default { id, setup(ctx) }), verified against
++// OpenCode 2.0.11:
++//   • config hook                     → ctx.command.transform + native skill
++//                                       discovery (the installer copies
++//                                       skills/ into the opencode skills dir;
++//                                       v2 has no config mutation hook)
++//   • experimental.chat.system.transform
++//                                     → ctx.session.hook("context"), pushing a
++//                                       { type: "text" } block
++//   • command.execute.before          → no v2 equivalent; /ponytail is now an
++//                                       execute-command that persists the mode
++//                                       itself, then submits the template
++//
++// This file is a patched copy. The pristine upstream version lives in
++// vendor/upstream/ponytail, and the port as a patch series in
++// vendor/patches/ponytail.
+ 
+ import { createRequire } from 'module';
+ import fs from 'fs';
+@@ -43,57 +61,80 @@ function writeMode(mode) {
+   fs.writeFileSync(statePath, mode);
+ }
+ 
+-export default async ({ client } = {}) => {
+-  const log = (level, message) => {
+-    try { client && client.app && client.app.log({ body: { service: 'ponytail', level, message } }); } catch (e) {}
+-  };
++// The /ponytail template, read once at setup. Its body tells the model what
++// each level means; $ARGUMENTS carries the requested mode.
++function ponytailCommandTemplate() {
++  try {
++    const file = path.join(__dirname, '..', 'command', 'ponytail.md');
++    const parsed = parseCommandFile(file);
++    return parsed ? parsed.template : '';
++  } catch (e) {
++    return '';
++  }
++}
+ 
+-  const ponytailSkillsDir = path.resolve(__dirname, '../../skills');
++export default {
++  id: 'ponytail',
+ 
+-  return {
+-    // Register slash commands + skills directory.
+-    config: async (config) => {
+-      if (!config.command) config.command = {};
+-      const commandDir = path.join(__dirname, '..', 'command');
+-      try {
+-        for (const file of fs.readdirSync(commandDir).filter((f) => f.endsWith('.md'))) {
+-          const name = path.basename(file, '.md');
+-          const parsed = parseCommandFile(path.join(commandDir, file));
+-          if (parsed) config.command[name] = parsed;
+-        }
+-      } catch (e) {}
++  async setup(ctx) {
++    // Register the /ponytail-* commands. The five read-only ones are plain
++    // template commands; /ponytail itself is an execute-command because the
++    // mode switch has to be persisted by us, deterministically, before the
++    // ruleset prompt goes out — v2 has no command.execute.before hook to do
++    // it for us.
++    const commandDir = path.join(__dirname, '..', 'command');
++    const ponytailTemplate = ponytailCommandTemplate();
+ 
+-      config.skills = config.skills || {};
+-      config.skills.paths = config.skills.paths || [];
+-      if (!config.skills.paths.includes(ponytailSkillsDir)) {
+-        config.skills.paths.push(ponytailSkillsDir);
++    await ctx.command.transform((editor) => {
++      for (const file of fs.readdirSync(commandDir).filter((f) => f.endsWith('.md'))) {
++        const name = path.basename(file, '.md');
++        if (name === 'ponytail') continue;
++        const parsed = parseCommandFile(path.join(commandDir, file));
++        if (parsed) {
++          editor.add({ name, description: parsed.description, template: parsed.template });
++        }
+       }
+-    },
++
++      editor.add({
++        name: 'ponytail',
++        description: 'Switch ponytail intensity level (lite/full/ultra/off)',
++        execute: async (input) => {
++          // `off` is persisted like any mode; the context hook reads it and
++          // stays silent. The persisted mode applies from this prompt on.
++          const args = String(
++            (input && input.arguments) ??
++              (input && input.prompt && input.prompt.text) ??
++              '',
++          ).trim();
++          const mode = args ? normalizePersistedMode(args) : getDefaultMode();
++          if (mode) writeMode(mode);
++
++          if (!ponytailTemplate) return;
++          const sessionID = input && input.sessionID;
++          if (!sessionID) return;
++          try {
++            await ctx.session.prompt({
++              sessionID,
++              text: ponytailTemplate.replace(/\$ARGUMENTS/g, args || ''),
++              delivery: (input && input.delivery) || 'steer',
++            });
++          } catch (e) {}
++        },
++      });
++    });
+ 
+     // Append the ruleset to the system prompt every turn.
+-    'experimental.chat.system.transform': async (_input, output) => {
++    await ctx.session.hook('context', (event) => {
+       const mode = readMode();
+       if (mode === 'off') return;
+-      const instructions = getPonytailInstructions(mode);
+-      if (output.system.length > 0) {
+-        output.system[output.system.length - 1] += '\n\n' + instructions;
+-      } else {
+-        output.system.push(instructions);
++      let instructions;
++      try {
++        instructions = getPonytailInstructions(mode);
++      } catch (e) {
++        return;
+       }
+-    },
+-
+-    // Persist `/ponytail <level>` so the next turn's injection follows it.
+-    // ponytail: mode applies from the next message, not the current one — the
+-    // transform reads the flag the command writes. Good enough; switch to a
+-    // synchronous store if same-turn switching ever matters.
+-    'command.execute.before': async (input) => {
+-      if (!input || input.command !== 'ponytail') return;
+-      // `off` is persisted like any mode; the transform reads it and stays silent.
+-      const args = String(input.arguments || '').trim();
+-      const mode = args ? normalizePersistedMode(args) : getDefaultMode();
+-      if (!mode) return;
+-      writeMode(mode);
+-      log('info', 'ponytail ' + mode);
+-    },
+-  };
++      if (!event || !Array.isArray(event.system)) return;
++      event.system.push({ type: 'text', text: instructions });
++    });
++  },
+ };

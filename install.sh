@@ -10,12 +10,27 @@
 # No agent-facing markdown lives here. Plain skill copies go to ~/.agents/skills,
 # which codex and opencode both read; claude is the exception and gets
 # ~/.claude/skills copies, since it does not read ~/.agents/skills. Where a
-# skill ships as a plugin, the plugin is the only copy. Idempotent. Only tools
-# on PATH get touched.
+# skill ships as a plugin, the plugin is the only copy. Idempotent, unless
+# --force: a normal run fixes what is broken or missing and leaves the rest
+# unchanged; --force clears only the plugins and skills this installer manages,
+# then reinstalls them — nothing else is touched, and the repo is only ever
+# read. Only tools on PATH get touched.
 set -eu
+
+force=0
+for arg in "$@"; do
+	case $arg in
+	--force) force=1 ;;
+	*)
+		echo "usage: install.sh [--force]" >&2
+		exit 2
+		;;
+	esac
+done
 
 codex_home=${CODEX_HOME:-$HOME/.codex}
 oc_home=${XDG_CONFIG_HOME:-$HOME/.config}/opencode
+repo=$(cd "$(dirname "$0")" && pwd)
 
 have() { command -v "$1" >/dev/null 2>&1; }
 run() { if [ -x "$1" ]; then "$1"; else sh "$1"; fi; }
@@ -40,8 +55,88 @@ oc_json() { # <filter> [jq args...]
 	filter=$1
 	shift
 	mkdir -p "$oc_home"
+	# OpenCode reads JSONC and tolerates trailing commas; jq does not. The
+	# config has carried such a comma before — without the fallback below,
+	# the parse failure would reset the whole file to {}. Sanitize, verify,
+	# and keep the sanitized form only when it parses.
+	if ! jq -e . "$f" >/dev/null 2>&1; then
+		perl -0777 -pe 's/,(\s*[}\]])/$1/g' "$f" >"$f.tmp" 2>/dev/null
+		if [ -s "$f.tmp" ] && jq -e . "$f.tmp" >/dev/null 2>&1; then
+			mv "$f.tmp" "$f"
+			echo "  repaired $f (trailing commas stripped for jq)"
+		else
+			rm -f "$f.tmp"
+		fi
+	fi
 	jq -e . "$f" >/dev/null 2>&1 || echo '{}' >"$f"
 	jq "$@" "$filter" "$f" >"$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# vend <name> [subpath...] — build a deployable opencode plugin tree at
+# $repo/build/<name> from the pristine source in vendor/<name> plus the patch
+# series in patches/<name>, and add the root index.mjs shim the v2 directory
+# loader needs. Whole tree when no subpaths are given. The vendored source
+# stays in the repo — nothing is copied into oc_home; opencode.json points at
+# the built tree here. Failure-safe: the previously built tree stays in place
+# until the staged build is complete, so a patch that no longer applies never
+# half-updates. No network.
+vend() {
+	name=$1
+	shift
+	src=$repo/vendor/$name
+	dest=$repo/build/$name
+	if [ ! -d "$src" ]; then
+		echo "  [FAIL] $name — vendored source missing ($src); run ./refresh.sh"
+		return 1
+	fi
+	stage=$tmp/vend-$name
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	if [ "$#" -gt 0 ]; then
+		for p in "$@"; do
+			if [ ! -e "$src/$p" ]; then
+				echo "  [FAIL] $name — no $p in the vendored source"
+				return 1
+			fi
+			cp -R "$src/$p" "$stage/$p"
+		done
+	else
+		cp -R "$src/." "$stage/"
+	fi
+	for p in "$repo/patches/$name"/*.patch; do
+		[ -e "$p" ] || continue
+		if ! (cd "$stage" && git apply -p1 "$p") 2>/dev/null &&
+			! (cd "$stage" && patch --silent -p1 <"$p") 2>/dev/null; then
+			echo "  [FAIL] $name — $(basename "$p") no longer applies to vendor/$name; rebase patches/$name"
+			return 1
+		fi
+	done
+	cat >"$stage/index.mjs" <<EOF
+// Vendored $name OpenCode plugin — root shim.
+//
+// OpenCode 2 loads a local plugin directory via its index.mjs; the real
+// plugin lives at ./.opencode/plugins/$name.mjs (upstream layout, kept intact
+// so its relative requires work). Built by install.sh from vendor/$name plus
+// patches/$name — the shim is generated, the rest is patched upstream source.
+export { default } from './.opencode/plugins/$name.mjs';
+EOF
+	mkdir -p "$(dirname "$dest")"
+	rm -rf "$dest"
+	mv "$stage" "$dest"
+	oc_json '.plugins = (((.plugins // []) + [$v]) | unique)' --arg v "$dest"
+	echo "  opencode plugin — built $dest (vendor/$name + patches/$name)"
+}
+
+# emit_skill <name> <bodyfile> <description> — write a SKILL.md from a vendored
+# body file, the way the upstream installers do. Idempotent.
+emit_skill() {
+	name=$1 body=$2 desc=$3
+	for dest in "$HOME/.agents/skills/$name/SKILL.md" "$HOME/.claude/skills/$name/SKILL.md"; do
+		if [ -L "$dest" ]; then rm "$dest"; fi
+		if [ -L "$(dirname "$dest")" ]; then rm "$(dirname "$dest")"; fi
+		mkdir -p "$(dirname "$dest")"
+		{ echo '---'; printf '%s\n' "name: $name"; printf '%s\n' 'description: >'; printf '  %s\n' "$desc"; echo '---'; echo; cat "$body"; } >"$dest"
+	done
 }
 
 # share <name> — leave one plain copy of a skill, in ~/.agents/skills, which
@@ -68,8 +163,9 @@ share() {
 # Lazy senior dev mode. Ships its own plugin per tool, with intensity levels, a
 # statusline and /ponytail-* commands, and injects its ruleset through a
 # SessionStart hook — so there is nothing here to wire and nothing to copy.
-# Claude and Codex install it from its marketplace; OpenCode takes the npm
-# package, which bundles the opencode plugin and the skills.
+# Claude and Codex install it from its marketplace; OpenCode takes the vendored
+# built from vendor/ponytail plus patches/ponytail (upstream still ships the v1
+# plugin API, which OpenCode 2 rejects — see vendor/patches/ponytail).
 echo "ponytail"
 if have claude; then
 	claude plugin marketplace add DietrichGebert/ponytail >/dev/null 2>&1 || true
@@ -86,15 +182,49 @@ if have codex; then
 		echo "  [FAIL] codex — a 'ponytail' marketplace from another source blocks it; codex plugin marketplace remove ponytail, then re-run"
 fi
 if have opencode && have jq; then
-	# One config line, no checkouts and no raw skill copies: opencode installs
-	# npm plugins itself and loads the skills bundled in the package.
-	oc_json '.plugin = (((.plugin // []) | map(select((test("ponytail[.]mjs$") or test("@dietrichgebert/ponytail")) | not))) + ["@dietrichgebert/ponytail"])'
-	echo "  opencode plugin (@dietrichgebert/ponytail from npm)"
+	# One-time migration of the v1 plugin config to the v2 plugins array:
+	# drop the npm ponytail entry, the bare .mjs vendor paths (v2 rejects
+	# both), and the retired $oc_home/vendor deployment location (plugins
+	# register directly into this repo's build/ now); keep any other entries.
+	# Content-stable under re-runs. The vend calls below then register the
+	# built plugin directories.
+	oc_json '
+		(if (.plugin | type) == "array"
+		then [.plugin[] | select(type == "string") | select(endswith(".mjs") | not) | select(. != "@dietrichgebert/ponytail")]
+		else [] end) as $kept
+		| .plugins = ((($kept + (.plugins // []))
+			| map(select(test("/opencode/vendor/") | not)))
+			| unique)
+		| del(.plugin)
+	'
+	if [ "$force" = 1 ]; then
+		# Forced reinstall, scoped to what this installer manages: the four
+		# built plugin trees and the skills it deploys. Anything else —
+		# including plugins and skills installed by other means — is left
+		# alone, and the repo's vendor/ and patches/ are only ever read.
+		for n in ponytail i-have-adhd learn visual; do
+			rm -rf "$repo/build/$n"
+		done
+		rm -rf "$oc_home/skills"/ponytail* "$oc_home/skills/i-have-adhd"
+		echo "  forced: cleared the built plugins and managed skills"
+	fi
+	vend ponytail
+	# Ponytail's bundled skills have no plugin skills-path mechanism in v2;
+	# the opencode-only skills dir takes over. cp -R is content-stable.
+	if [ -d "$repo/vendor/ponytail/skills" ]; then
+		mkdir -p "$oc_home/skills"
+		for s in "$repo"/vendor/ponytail/skills/*/; do
+			n=$(basename "$s")
+			rm -rf "$oc_home/skills/$n"
+			cp -R "$s" "$oc_home/skills/$n"
+		done
+		echo "  skills into $oc_home/skills (ponytail, ponytail-*)"
+	fi
 fi
-# Old per-tool copies from earlier layouts: every tool now gets ponytail
-# through a plugin.
+# Old per-tool copies from earlier layouts. Ponytail's skills now install to
+# the opencode-only skills dir (see above); the tool-home copies stay removed.
 rm -rf "$codex_home/skills/ponytail" "$HOME/.opencode/skills/ponytail" \
-	"$HOME/.claude/skills/ponytail" "$oc_home/skills/ponytail"
+	"$HOME/.claude/skills/ponytail"
 
 # --- i-have-adhd ---------------------------------------------------------------
 # Output shaping. Upstream ships a plugin for each of these three and its own
@@ -133,23 +263,14 @@ if have codex; then
 	fi
 fi
 if have opencode && have jq; then
-	# OpenCode loads a plugin from a path, so this is the one checkout that has
-	# to persist. Upstream's own suggested location.
-	vend=$oc_home/vendor/i-have-adhd
-	if [ -d "$vend/.git" ]; then
-		git -C "$vend" pull --quiet --ff-only >/dev/null 2>&1 || true
-	else
-		mkdir -p "$(dirname "$vend")"
-		git clone --quiet "$adhd" "$vend" >/dev/null 2>&1 || true
-	fi
-	if [ -f "$vend/.opencode/plugins/i-have-adhd.mjs" ]; then
-		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' \
-			--arg v "$vend/.opencode/plugins/i-have-adhd.mjs"
-		touch "$oc_home/.i-have-adhd-always"
-		echo "  opencode plugin — always on via $oc_home/.i-have-adhd-always"
-	else
-		echo "  [FAIL] opencode — cannot vendor $adhd to $vend"
-	fi
+	# Vendored source + the v2 patch replace the install-time git clone. The
+	# skill goes to the opencode-only skills dir: v2 has no config
+	# skills.paths hook, and ~/.agents/skills would surface it to codex too.
+	vend i-have-adhd .opencode skills
+	rm -rf "$oc_home/skills/i-have-adhd"
+	cp -R "$repo/vendor/i-have-adhd/skills/i-have-adhd" "$oc_home/skills/i-have-adhd"
+	touch "$oc_home/.i-have-adhd-always"
+	echo "  opencode plugin — always on via $oc_home/.i-have-adhd-always"
 fi
 # Old per-tool copies from earlier layouts. OpenCode loads skills bundled with
 # plugins — npm or path — so it needs no raw copies at all.
@@ -157,56 +278,64 @@ rm -rf "$codex_home/skills/i-have-adhd" "$HOME/.opencode/skills/i-have-adhd" \
 	"$HOME/.claude/skills/i-have-adhd" "$oc_home/skills/i-have-adhd"
 
 # --- learn ----------------------------------------------------------------------
-# Guided exploration, /learn. Installs itself to all three; on demand, no wiring
-# beyond the always-on plugin its installer vendored — the path goes into
-# opencode.json here, since this file owns that config. The mode itself is off
-# until /learn or "learn always".
+# Guided exploration, /learn. Vendored: the skill body (LEARN.md) and its
+# description come from the pristine snapshot under vendor/learn, and the
+# always-on plugin is built from vendor/learn plus patches/learn — no clone at
+# install time.
+learn_desc='Interactive, user-steered exploration of any subject to any depth — code, mathematics, biology, film, a market, a machine, or an idea. Explains mechanism, challenges the framing, and brainstorms one move at a time, moving down into how something happens, up into why its class of thing exists, across to alternatives and prior art, apart into components and steps, back to the forces that shaped it, or sideways onto a chosen lens such as energy, cost, latency, rigour, or audience. Checks what stayed with recall and teach-it-back drills, and tunes depth to how well predictions land. Resumes open threads from LEARNING.md and appends the trail back to it. A session mode — "stop learn mode" turns it off for the rest of the session, and "learn always" keeps it on in every session until "learn never" removes it. Use when asked to learn about, explore, dissect, study, unpack, or go deeper on anything.'
 echo "learn"
-if d=$(clone https://github.com/inifares23lab/learnkit.git); then
-	run "$d/install.sh"
-	share learn
-	mjs=$oc_home/vendor/learn/learn.mjs
-	if have jq && [ -f "$mjs" ]; then
-		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
-		echo "  opencode always-on plugin"
+if [ -f "$repo/vendor/learn/LEARN.md" ]; then
+	emit_skill learn "$repo/vendor/learn/LEARN.md" "$learn_desc"
+	echo "  skill for claude + ~/.agents (codex, opencode)"
+	if have opencode; then
+		mkdir -p "$oc_home/command"
+		{ echo '---'; printf '%s\n' "description: $learn_desc"; echo '---'; echo; cat "$repo/vendor/learn/LEARN.md"; } >"$oc_home/command/learn.md"
 	fi
+	vend learn .opencode
+	echo "  opencode always-on plugin"
+else
+	echo "  [FAIL] learn — vendored snapshot missing; run ./refresh.sh"
 fi
 
 # --- visual ---------------------------------------------------------------------
-# Figures in text documents, /visual. Same shape as learn.
+# Figures in text documents, /visual. Same shape as learn: vendored snapshot,
+# no clone at install time.
+visual_desc='Add ASCII diagrams, figures, and hand-written SVG visual aids to otherwise text-only documents, on any subject — engineering, science, business, law, music, anything whose parts relate. Matches the shape of the relationship rather than the domain, so a protein, a supply chain, and a service mesh that share a shape get the same figure. Picks the form (box-and-line, sequence ladder, state machine, pipeline, layer stack, tree, timeline, field map, bar row, scale drawing, plot, arrow field) and the medium (inline ASCII for topology, SVG when positions carry meaning — angles, curves, scale, continuous values), lays a column ruler before drawing, and ships the figure aligned, labelled, and under 72 columns. Draws by default rather than describing, puts the figure above the detail it maps, and deletes the prose it replaces. A session mode — "no diagrams" turns it off for the rest of the session, and "visual always" keeps it on in every session until "visual never" removes it. Use when writing or revising a spec, proposal, design note, plan, README, learning notes, or any page working out how something fits together.'
 echo "visual"
-if d=$(clone https://github.com/inifares23lab/visual-docs.git); then
-	run "$d/install.sh"
-	share visual
-	mjs=$oc_home/vendor/visual/visual.mjs
-	if have jq && [ -f "$mjs" ]; then
-		oc_json '.plugin = ((.plugin // [] | map(select(. != $v))) + [$v])' --arg v "$mjs"
-		echo "  opencode always-on plugin"
+if [ -f "$repo/vendor/visual/VISUAL.md" ]; then
+	emit_skill visual "$repo/vendor/visual/VISUAL.md" "$visual_desc"
+	echo "  skill for claude + ~/.agents (codex, opencode)"
+	if have opencode; then
+		mkdir -p "$oc_home/command"
+		{ echo '---'; printf '%s\n' "description: $visual_desc"; echo '---'; echo; cat "$repo/vendor/visual/VISUAL.md"; } >"$oc_home/command/visual.md"
 	fi
+	vend visual .opencode
+	echo "  opencode always-on plugin"
+else
+	echo "  [FAIL] visual — vendored snapshot missing; run ./refresh.sh"
 fi
 
 # --- visual-explainer -------------------------------------------------------------
 # Self-contained HTML visual explanations — diagrams, decks, diff and plan
 # reviews, project recaps. A whole plugin tree per tool home, the way its own
 # installer ships it; its command templates join the opencode command dir.
+# Served from the vendored snapshot — no clone at install time.
 echo "visual-explainer"
-if d=$(clone https://github.com/nicobailon/visual-explainer.git); then
-	src="$d/plugins/visual-explainer"
-	if [ -f "$src/SKILL.md" ]; then
-		for home in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
-			rm -rf "$home/visual-explainer"
-			mkdir -p "$home"
-			cp -R "$src" "$home/visual-explainer"
-		done
-		mkdir -p "$oc_home/command"
-		if cp -R "$src"/commands/*.md "$oc_home/command/" 2>/dev/null; then
-			echo "  skill for claude + ~/.agents (codex, opencode) + opencode commands"
-		else
-			echo "  skill for claude + ~/.agents (codex, opencode)"
-		fi
+src=$repo/vendor/visual-explainer/plugins/visual-explainer
+if [ -f "$src/SKILL.md" ]; then
+	for home in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+		rm -rf "$home/visual-explainer"
+		mkdir -p "$home"
+		cp -R "$src" "$home/visual-explainer"
+	done
+	mkdir -p "$oc_home/command"
+	if cp -R "$src"/commands/*.md "$oc_home/command/" 2>/dev/null; then
+		echo "  skill for claude + ~/.agents (codex, opencode) + opencode commands"
 	else
-		echo "  [FAIL] visual-explainer — no SKILL.md in the plugin tree"
+		echo "  skill for claude + ~/.agents (codex, opencode)"
 	fi
+else
+	echo "  [FAIL] visual-explainer — vendored snapshot missing; run ./refresh.sh"
 fi
 
 # --- typesafe-ai ------------------------------------------------------------------
@@ -224,38 +353,58 @@ if have claude; then
 		echo "  claude plugin" ||
 		echo "  [FAIL] claude — claude plugin install typesafe@typesafe-ai"
 fi
-if d=$(clone https://github.com/typesafe-ai/skills.git); then
-	src="$d/skills/typesafe-ai"
-	if [ -f "$src/SKILL.md" ]; then
-		rm -rf "$HOME/.agents/skills/typesafe-ai" \
-			"$HOME/.opencode/skills/typesafe-ai" "$codex_home/skills/typesafe-ai"
-		mkdir -p "$HOME/.agents/skills"
-		cp -R "$src" "$HOME/.agents/skills/typesafe-ai"
-		echo "  skill in ~/.agents/skills (codex, opencode)"
-	else
-		echo "  [FAIL] typesafe-ai — no SKILL.md in the clone"
-	fi
+if [ -f "$repo/vendor/typesafe-ai/skills/typesafe-ai/SKILL.md" ]; then
+	rm -rf "$HOME/.agents/skills/typesafe-ai" \
+		"$HOME/.opencode/skills/typesafe-ai" "$codex_home/skills/typesafe-ai"
+	mkdir -p "$HOME/.agents/skills"
+	cp -R "$repo/vendor/typesafe-ai/skills/typesafe-ai" "$HOME/.agents/skills/typesafe-ai"
+	echo "  skill in ~/.agents/skills (codex, opencode)"
+else
+	echo "  [FAIL] typesafe-ai — vendored snapshot missing; run ./refresh.sh"
 fi
 
 # --- openspec ---------------------------------------------------------------------
-# Spec-driven change, /opsx:*. Two halves. The CLI on PATH does the work; the
-# skill and command files are generated once into the tool homes, so every
-# session sees /opsx:* — while specs and changes stay per project, in each
-# repo's own openspec/.
+# Spec-driven change, /opsx:*. Two halves. The CLI on PATH does the work (a
+# missing CLI installs from the vendored npm tree in vendor/openspec — no
+# registry); the skill and command files are generated at install time by that
+# local CLI in a throwaway project, so every session sees /opsx:* — while
+# specs and changes stay per project, in each repo's own openspec/.
 echo "openspec"
+# install_cli — npm install -g from the vendored tree, with the reason on
+# failure (permission walls on a root-owned global prefix are common).
+install_cli() {
+	err=$(npm install -g "$repo/vendor/openspec" 2>&1) && rc=0 || rc=$?
+	if [ "$rc" -eq 0 ]; then
+		echo "  installed from vendor — $(openspec --version 2>/dev/null || echo yes)"
+	else
+		echo "  [FAIL] npm install -g from $repo/vendor/openspec"
+		printf '%s\n' "$err" | grep -m1 "npm error" | sed 's/^/    /'
+		printf '    (fix the npm global prefix permissions, then re-run)\n'
+	fi
+}
 if have openspec; then
 	echo "  present — $(openspec --version 2>/dev/null || echo yes)"
-elif have npm; then
-	npm install -g @fission-ai/openspec@latest >/dev/null 2>&1 &&
-		echo "  installed" || echo "  [FAIL] npm install -g @fission-ai/openspec@latest"
+	if [ -d "$repo/vendor/openspec" ]; then
+		vendored=$(jq -r .version "$repo/vendor/openspec/package.json" 2>/dev/null)
+		if [ "$force" = 1 ]; then
+			# Forced reinstall: the CLI is only installed when missing on a
+			# normal run, so --force is how a bumped MANIFEST ref lands.
+			install_cli
+		elif [ -n "$vendored" ] && [ "$(openspec --version 2>/dev/null)" != "$vendored" ]; then
+			echo "  note: vendor has $vendored, installed differs — run install.sh --force to update"
+		fi
+	fi
+elif [ -d "$repo/vendor/openspec" ]; then
+	install_cli
 else
-	echo "  [skip] no npm"
+	echo "  [skip] no openspec, no vendored CLI"
 fi
 if have openspec && have git; then
-	# Generated in a throwaway project: only the .claude/.agents trees belong on
-	# the machine — .agents is the shared home codex and opencode both read,
-	# .claude the copy claude needs. The scratch openspec/ dies with it. Stale
-	# openspec-* files go first, so a workflow removed upstream does not linger.
+	# Generated in a throwaway project by the local CLI: only the .claude/.agents
+	# trees belong on the machine — .agents is the shared home codex and opencode
+	# both read, .claude the copy claude needs. The scratch openspec/ dies with
+	# it. Stale openspec-* files go first, so a workflow removed upstream does
+	# not linger.
 	opsx=$(mktemp -d)
 	git init -q "$opsx" 2>/dev/null || true
 	if (cd "$opsx" && openspec init --tools opencode,claude,codex \
