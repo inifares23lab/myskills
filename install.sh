@@ -366,7 +366,7 @@ fi
 # --- openspec ---------------------------------------------------------------------
 # Spec-driven change, /opsx:*. Two halves. The CLI on PATH does the work (a
 # missing CLI installs from the vendored npm tree in vendor/openspec — no
-# registry); the skill and command files are generated at install time by that
+# registry); the skill files are generated at install time by that
 # local CLI in a throwaway project, so every session sees /opsx:* — while
 # specs and changes stay per project, in each repo's own openspec/.
 echo "openspec"
@@ -415,13 +415,7 @@ if have openspec && have git; then
 		done
 		cp -R "$opsx/.agents/skills/." "$HOME/.agents/skills/"
 		cp -R "$opsx/.claude/skills/." "$HOME/.claude/skills/"
-		mkdir -p "$oc_home/command"
-		rm -f "$oc_home/command"/opsx-*.md
-		cp -R "$opsx/.opencode/commands/." "$oc_home/command/"
-		mkdir -p "$HOME/.claude/commands"
-		rm -rf "$HOME/.claude/commands/opsx"
-		cp -R "$opsx/.claude/commands/." "$HOME/.claude/commands/"
-		echo "  skills + commands for opencode, claude, codex"
+		echo "  skills for opencode, claude, codex"
 	else
 		echo "  [FAIL] openspec init — global skills not generated"
 	fi
