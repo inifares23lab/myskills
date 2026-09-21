@@ -30,6 +30,7 @@ done
 
 codex_home=${CODEX_HOME:-$HOME/.codex}
 oc_home=${XDG_CONFIG_HOME:-$HOME/.config}/opencode
+oc_plugins=$oc_home/plugins
 repo=$(cd "$(dirname "$0")" && pwd)
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -73,18 +74,19 @@ oc_json() { # <filter> [jq args...]
 }
 
 # vend <name> [subpath...] — build a deployable opencode plugin tree at
-# $repo/build/<name> from the pristine source in vendor/<name> plus the patch
+# $oc_plugins/<name> from the pristine source in vendor/<name> plus the patch
 # series in patches/<name>, and add the root index.mjs shim the v2 directory
 # loader needs. Whole tree when no subpaths are given. The vendored source
-# stays in the repo — nothing is copied into oc_home; opencode.json points at
-# the built tree here. Failure-safe: the previously built tree stays in place
+# stays in the repo (read-only) — the built tree is copied into the config
+# home, so opencode.json never references this repo and the repo can be thrown
+# away after install. Failure-safe: the previously built tree stays in place
 # until the staged build is complete, so a patch that no longer applies never
 # half-updates. No network.
 vend() {
 	name=$1
 	shift
 	src=$repo/vendor/$name
-	dest=$repo/build/$name
+	dest=$oc_plugins/$name
 	if [ ! -d "$src" ]; then
 		echo "  [FAIL] $name — vendored source missing ($src); run ./refresh.sh"
 		return 1
@@ -116,15 +118,16 @@ vend() {
 //
 // OpenCode 2 loads a local plugin directory via its index.mjs; the real
 // plugin lives at ./.opencode/plugins/$name.mjs (upstream layout, kept intact
-// so its relative requires work). Built by install.sh from vendor/$name plus
-// patches/$name — the shim is generated, the rest is patched upstream source.
+// so its relative requires work). Installed by install.sh from vendor/$name
+// plus patches/$name into $oc_plugins — the shim is generated, the rest is
+// patched upstream source.
 export { default } from './.opencode/plugins/$name.mjs';
 EOF
 	mkdir -p "$(dirname "$dest")"
 	rm -rf "$dest"
 	mv "$stage" "$dest"
 	oc_json '.plugins = (((.plugins // []) + [$v]) | unique)' --arg v "$dest"
-	echo "  opencode plugin — built $dest (vendor/$name + patches/$name)"
+	echo "  opencode plugin — installed $dest (vendor/$name + patches/$name)"
 }
 
 # emit_skill <name> <bodyfile> <description> — write a SKILL.md from a vendored
@@ -184,29 +187,31 @@ fi
 if have opencode && have jq; then
 	# One-time migration of the v1 plugin config to the v2 plugins array:
 	# drop the npm ponytail entry, the bare .mjs vendor paths (v2 rejects
-	# both), and the retired $oc_home/vendor deployment location (plugins
-	# register directly into this repo's build/ now); keep any other entries.
-	# Content-stable under re-runs. The vend calls below then register the
-	# built plugin directories.
+	# both), the retired $oc_home/vendor deployment location, and the retired
+	# $repo/build deployment location (plugins used to register straight into
+	# this repo's build/; opencode.json must never reference the repo). Keep
+	# any other entries. Content-stable under re-runs. The vend calls below
+	# then register the installed plugin directories under $oc_home/plugins.
 	oc_json '
 		(if (.plugin | type) == "array"
 		then [.plugin[] | select(type == "string") | select(endswith(".mjs") | not) | select(. != "@dietrichgebert/ponytail")]
 		else [] end) as $kept
 		| .plugins = ((($kept + (.plugins // []))
-			| map(select(test("/opencode/vendor/") | not)))
+			| map(select(test("/opencode/vendor/") | not))
+			| map(select(test("/build/(ponytail|i-have-adhd|learn|visual)$") | not)))
 			| unique)
 		| del(.plugin)
 	'
 	if [ "$force" = 1 ]; then
 		# Forced reinstall, scoped to what this installer manages: the four
-		# built plugin trees and the skills it deploys. Anything else —
+		# installed plugin trees and the skills it deploys. Anything else —
 		# including plugins and skills installed by other means — is left
 		# alone, and the repo's vendor/ and patches/ are only ever read.
 		for n in ponytail i-have-adhd learn visual; do
-			rm -rf "$repo/build/$n"
+			rm -rf "$oc_plugins/$n"
 		done
 		rm -rf "$oc_home/skills"/ponytail* "$oc_home/skills/i-have-adhd"
-		echo "  forced: cleared the built plugins and managed skills"
+		echo "  forced: cleared the installed plugins and managed skills"
 	fi
 	vend ponytail
 	# Ponytail's bundled skills have no plugin skills-path mechanism in v2;

@@ -78,10 +78,10 @@ from upstream's own mechanisms. An earlier layout pasted the `SKILL.md` body
 into a `<!-- myskills:i-have-adhd -->` region of `~/.codex/AGENTS.md`; the
 plugin hook made that redundant, and `install.sh` deletes the stale region.
 
-OpenCode is also the one exception to throwaway clones — it loads a plugin from
-a path, so that checkout persists at `~/.config/opencode/vendor/i-have-adhd` and
-is `git pull`ed on re-runs. ponytail needs no checkout: opencode installs the
-npm package itself.
+OpenCode v2 loads a plugin from a path, so the built trees are copied into
+`~/.config/opencode/plugins/` at install time and `opencode.json` points there.
+Nothing in the system references this repo — run `./install.sh`, then the repo
+can be thrown away.
 
 **Codex needs one manual step per hooking plugin.** Codex will not run a
 plugin's hooks until they are trusted. Open `codex`, run `/hooks`, trust
@@ -1526,11 +1526,12 @@ nothing (the bug this config shipped with once).
 ```sh
 rm -f ~/.claude/.i-have-adhd-always ~/.config/opencode/.i-have-adhd-always \
       ~/.config/opencode/.learn-always ~/.config/opencode/.visual-always
-rm -rf ~/.config/opencode/vendor/i-have-adhd \
-       ~/.config/opencode/vendor/learn ~/.config/opencode/vendor/visual
+rm -rf ~/.config/opencode/plugins
 rm -rf ~/.agents/skills/{learn,visual,visual-explainer,openspec-*,typesafe-ai} \
        ~/.claude/skills/{learn,visual,visual-explainer,openspec-*,typesafe-ai}
 ```
 
 Then the plugins through their own tools: `claude plugin uninstall`, `codex
-plugin remove`, and the `plugin` entries in `opencode.json`.
+plugin remove`, and remove the `plugins` entries OpenCode has in `opencode.json`.
+The repo itself is only ever read — uninstalling and deleting it are
+independent.
