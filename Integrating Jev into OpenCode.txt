@@ -1,0 +1,867 @@
+﻿Integrating Jev into OpenCode
+https://gemini.google.com/app/6ab84cb7d058f696
+
+
+User prompt: Is there something that allows jev to classify user input to restrict the intent drift from system 2 models
+Response: It appears that several patterns and framework implementations use TypeSafe Jev as an intent classifier and guardrail to restrict intent drift from System 2 (generative/reasoning) models. Because System 2 models are prone to open-ended instruction drift and hallucination, Jev is deployed as a fast (~100ms) pre-execution gate or mid-loop trajectory validator.
+Key Mechanisms
+1. Jev Intent Classifier / Router (Choice Primitive) Frameworks like the LangChain Jev Harness and n8n Jev Router evaluate incoming user prompts through Jev before calling the System 2 model. Jev scores the input against pre-defined intent buckets (e.g., ["coding", "database", "out_of_bounds"]) and emits a probability distribution. If the input classifies as out_of_bounds, the System 2 model is never invoked.
+2. Probability & Confidence Thresholding (jevcal) Unlike standard LLMs, Jev returns explicit confidence scores alongside its predictions. Architectures leverage calibration tooling like jevcal to enforce hard confidence thresholds (e.g., p<0.85), routing low-confidence or ambiguous inputs to safety fallbacks rather than allowing a System 2 model to make ungrounded inferences.
+3. Tool & State Approval Gates (e.g., Vercel eve) In agentic loops, middleware such as Vercel's eve passes proposed System 2 actions into Jev to classify them as clear vs. caution prior to execution. This restricts System 2 models from drifting into unintended tool usage or modifying state out of turn.
+Operational Doubts & Limitations
+* Edge-Case Misclassification: Early benchmarking indicates Jev may over-classify out-of-domain or nuanced prompts into broad "other" or false-positive categories more frequently than larger reasoning models.
+* No Semantic Context Repair: While Jev can reject or reroute a drifting prompt, it cannot reformulate or repair ambiguous user context on its own.
+* Context Truncation Risk: Evaluating long multi-turn conversations against broad intent schemas may hit Jev's context ceilings, necessitating lossy state truncation prior to classification.
+Bibliography & References
+* Vercel AI SDK / eve Integration Guide: How to automatically approve tool calls in eve with Jev
+* LangChain Blog: Building an Agent Harness with Jev
+* Awesome Jev Ecosystem Repository: cobanov/awesome-jev GitHub
+* Cribl Analysis on System One Models: What TypeSafe's Jev Means for Telemetry
+* DataCamp Guide: Jev: TypeSafe's System One Model Explained
+Sources
+1. Jev Explained: Typesafe AI's Non-Autoregressive System-1 Model
+2. Jev AI Use Cases - Medium
+3. Jev: TypeSafe's System One Model Explained - DataCamp
+4. How to automatically approve tool calls in eve with Jev - Vercel
+5. What TypeSafe's Jev means for telemetry - Cribl
+________________
+
+
+User prompt: So eve, jev classifier, jevcal, jev intent router. i want to have a guardrail when prompting to opencode or other coding agent to ensure my intent is captured with a very high probability else it falls back to clarify with the user. and the implementation does not stray from the exact intent captured. moreover how can i enforce an input structure so that they are more jev friendly, because a free text input can still be largely misinterpreted.
+Response: To enforce high-probability intent capture and prevent System 2 coding models (such as those driving OpenCode) from drifting, you can implement a two-sided Jev sandwich architecture:
+1. Pre-Execution (Intent Capture & Calibration): Formats user input, routes it via jev-classifier, validates confidence via jevcal, and forces a clarification dialogue if ambiguity exceeds a strict threshold.
+2. In-Loop Trajectory Gate (eve + OpenCode Hooks): Locks down the captured spec and intercepts every OpenCode tool execution via tool.execute.before to verify that proposed changes remain within bounds.
+Phase 1: Structuring Inputs to be "Jev-Friendly"
+Free-form, open-ended text leads to high variance in System One classification. Jev performs best when evaluating discrete state objects with explicit keys rather than parsing unformatted prose.
+Instead of feeding raw prompts directly, pass input through a Structured Intent Schema:
+{
+ "intent_manifest": {
+   "action": "refactor | feature | bugfix | chore",
+   "target_scope": ["src/controllers/auth.ts"],
+   "acceptance_criteria": ["Replace JWT verification with HMAC session check"],
+   "non_goals": ["Do not touch database schema", "Do not modify user routes"],
+   "raw_prompt": "Replace JWT with HMAC in auth controller, leave DB untouched"
+ }
+}
+
+Enforcing the Structure
+* CLI Pre-Flight Wrapper: Before invoking OpenCode, run a lightweight prompt template (e.g., using gum or Inquirer.js) to capture action, scope, and non_goals interactively.
+* Jev Pre-Parser: If starting from raw text, use a fast Jev extraction pass to normalize the input into the intent_manifest JSON schema before downstream evaluation.
+Phase 2: Pre-Execution Intent Guardrail (jev-classifier + jevcal)
+Before OpenCode initializes its System 2 loop, evaluate the intent_manifest against Jev's Choice and Noul primitives.
+import { JevClient } from "@typesafe/jev";
+import { jevcal } from "jevcal";
+
+const jev = new JevClient({ apiKey: process.env.JEV_API_KEY });
+
+async function validateUserIntent(manifest: object) {
+ // 1. Evaluate Intent & Ambiguity in a single parallel pass
+ const response = await jev.evaluate({
+   state: manifest,
+   questions: {
+     intent_category: {
+       type: "Choice",
+       options: ["refactor", "feature", "bugfix", "out_of_scope"]
+     },
+     is_unambiguous: {
+       type: "Noul",
+       statement: "The target scope and acceptance criteria are fully specified and safe to execute automatically."
+     }
+   }
+ });
+
+ // 2. Pass probabilities through jevcal to get calibrated confidence
+ const calibratedConfidence = jevcal.calibrate(response.questions.is_unambiguous.probability);
+ const selectedChoice = response.questions.intent_category.winner;
+
+ // 3. High-probability decision gate
+ if (calibratedConfidence < 0.92 || selectedChoice === "out_of_scope") {
+   return {
+     status: "CLARIFY_WITH_USER",
+     reason: `Low confidence (${(calibratedConfidence * 100).toFixed(1)}%). Please specify exact files or acceptance criteria.`
+   };
+ }
+
+ return { status: "PROCEED", manifest };
+}
+
+If status === "CLARIFY_WITH_USER", execution halts immediately and prompts the developer for targeted input rather than handing an ambiguous prompt to OpenCode.
+Phase 3: Preventing Execution Drift (eve + OpenCode Tool Hook)
+Once an intent is validated, lock down the intent_manifest as an immutable invariant for the session. Use Vercel's eve tool-approval patterns integrated directly into OpenCode's plugin API.
+Create an OpenCode plugin (.opencode/plugins/intent-guardrail.ts) that intercepts tool calls before execution:
+// OpenCode Plugin: .opencode/plugins/intent-guardrail.ts
+import { JevClient } from "@typesafe/jev";
+
+const jev = new JevClient({ apiKey: process.env.JEV_API_KEY });
+let lockedManifest: any = null;
+
+export const intentGuardrailPlugin = {
+ // Store validated intent on session start
+ "session.start": async (context) => {
+   lockedManifest = context.sessionStorage.get("intent_manifest");
+ },
+
+ // Intercept every tool action before OpenCode executes it
+ "tool.execute.before": async (input, output) => {
+   const proposedAction = {
+     tool: input.tool, // e.g. "bash", "write_file", "edit_file"
+     params: input.args, // e.g. { path: "src/db/schema.ts", content: "..." }
+   };
+
+   // Evaluate proposed tool call against the locked manifest
+   const result = await jev.evaluate({
+     state: {
+       manifest: lockedManifest,
+       proposed_action: proposedAction
+     },
+     questions: {
+       aligns_with_intent: {
+         type: "Noul",
+         statement: "Does this specific tool action strictly align with the target scope and acceptance criteria without violating non_goals?"
+       }
+     }
+   });
+
+   // Block action if intent drift is detected
+   if (result.questions.aligns_with_intent.probability < 0.95) {
+     throw new Error(
+       `[INTENT DRIFT BLOCKED] Proposed tool call '${input.tool}' on '${JSON.stringify(input.args)}' ` +
+       `strayed from locked intent non-goals/scope.`
+     );
+   }
+ }
+};
+
+System Summary
+[ User Input ]
+     │
+     ▼
+[ Input Structurer ] ──► Transforms free text into JSON Intent Manifest
+     │
+     ▼
+[ Jev Classifier + jevcal ]
+     ├── (Confidence < 92%) ──► [ User Clarification Loop ] (Halts Execution)
+     │
+     └── (Confidence ≥ 92%) ──► Lock Manifest & Start OpenCode
+                                      │
+                                      ▼
+                              [ OpenCode System 2 Loop ]
+                                      │
+                               (Tool Call Proposed)
+                                      │
+                                      ▼
+                              [ eve / Jev Plugin Hook ]
+                                      ├── (Aligned) ──────► Run Tool
+                                      └── (Drift < 95%) ──► Block Tool Call
+
+References
+* OpenCode Plugin Architecture & Tool Interception: OpenGuardrails Integration Guide
+* Vercel eve Auto-Approval Guardrails: Vercel Guide to Auto-Approving Tool Calls with Jev
+* System One Models & Calibration: LangChain Guide to Building a Harness with Jev
+Sources
+1. Guarding an opencode agent with OpenGuardrails
+2. What Is Jev? A Guide to TypeSafe AI's System One Model - LangChain
+________________
+
+
+User prompt: This sounds good, can you go more in the detail in the system diagram
+Response: The two-sided Jev sandwich architecture decomposes intent control into three isolated execution stages: Schema Normalization, Pre-Execution Calibration, and In-Loop Trajectory Interception.
+It remains dubious whether rigid probability gates can eliminate all failure modes, but this architecture appears to significantly restrict ungrounded System 2 execution paths.
+Expanded System Data Flow & State Transitions
+                                  ┌─────────────────────────────┐
+                                 │      Raw User Prompt        │
+                                 └──────────────┬──────────────┘
+                                                │
+                                                ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1: SCHEMA NORMALIZATION ENGINE                                                             │
+│ - Parses unstructured text or CLI parameters into a deterministic JSON object.                    │
+│ - Output Schema: intent_manifest { action_type, target_scope, acceptance_criteria, non_goals }   │
+└────────────────────────────────────────────────┬─────────────────────────────────────────────────┘
+                                                │
+                                                ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2: PRE-EXECUTION GATE (jev-classifier + jevcal)                                           │
+│ 1. Jev.Choice  ──► Categorizes intent ("refactor", "bugfix", "feature", "out_of_bounds").        │
+│ 2. Jev.Noul    ──► Evaluates binary statement ("Is scope fully bounded and unambiguous?").        │
+│ 3. jevcal      ──► Applies non-linear recalibration curve to raw Jev probability output.         │
+└────────────────────────────────┬─────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │ Decision Gate:                │
+                │ P_cal ≥ 0.92 AND              │
+                │ Category ≠ "out_of_bounds"?   │
+                └───────┬───────────────┬───────┘
+                        │               │
+                No (Fail)               Yes (Pass)
+                        │               │
+                        ▼               ▼
+       ┌──────────────────┐   ┌───────────────────────────────────────────────────────────────────┐
+       │ HALT EXECUTION   │   │ LOCK MANIFEST STATE                                               │
+       │ Trigger User     │   │ Write `.opencode/state/locked_manifest.json`                     │
+       │ Clarification    │   └─────────────────────────────────┬─────────────────────────────────┘
+       │ Dialogue         │                                     │
+       └──────────────────┘                                     ▼
+                              ┌───────────────────────────────────────────────────────────────────┐
+                              │ STAGE 3: OPENCODE SYSTEM 2 GENERATIVE LOOP                        │
+                              │ Model proposes tool call: T_i = { tool_name, parameters }         │
+                              └─────────────────────────────────┬─────────────────────────────────┘
+                                                                │
+                                                                ▼
+                              ┌───────────────────────────────────────────────────────────────────┐
+                              │ EVE INTERCEPTOR HOOK (`tool.execute.before`)                      │
+                              │ Evaluates proposed T_i against locked_manifest.json via Jev.Noul  │
+                              └─────────────────────────────────┬─────────────────────────────────┘
+                                                                │
+                                                ┌───────────────┴───────────────┐
+                                                │ Decision Gate:                │
+                                                │ P_align ≥ 0.95?               │
+                                                └───────┬───────────────┬───────┘
+                                                        │               │
+                                                No (Fail)               Yes (Pass)
+                                                        │               │
+                                                        ▼               ▼
+                                       ┌──────────────────┐   ┌───────────────────────────────────┐
+                                       │ BLOCK TOOL CALL  │   │ EXECUTE TOOL CALL                 │
+                                       │ Abort action &   │   │ Return result to OpenCode context │
+                                       │ alert agent      │   └───────────────────────────────────┘
+                                       └──────────────────┘
+
+Component Breakdown & Technical Nuances
+1. Schema Normalization Engine
+* Execution: Converts free text into a constrained intent_manifest JSON schema prior to evaluation.
+* Hypothesized Risk: Automated normalization passes using LLMs or extraction templates may inadvertently introduce hallucinated constraints or strip out subtle edge-case requirements specified by the user.
+2. Pre-Execution Calibration Node (jev-classifier + jevcal)
+* Execution: Evaluates the manifest against two parallel System One queries:
+   1. Pcategory​=Jev.Choice(options=["refactor","feature","bugfix","out_of_bounds"])
+   2. Punambiguous​=Jev.Noul("Target scope and criteria are fully bounded")
+* Calibration: Pcal​=jevcal.calibrate(Punambiguous​).
+* Hypothesized Risk: It is uncertain whether static calibration curves in jevcal generalize across highly heterogeneous codebases without requiring domain-specific fine-tuning datasets.
+3. In-Loop Trajectory Interceptor (eve Plugin)
+* Execution: Hooks directly into OpenCode's execution lifecycle (tool.execute.before). Each proposed command Ti​ (e.g., file edits, terminal execution) is validated via Jev against the locked manifest:
+Palign​=Jev.Noul("Proposed action Ti​ strictly adheres to non-goals and target scope")
+* Hypothesized Risk: Multi-step refactoring workflows may suffer from false-positive blocks if an intermediate step appears to violate end-state criteria before reaching final completion.
+Interactive System Architecture & Gate Simulator
+The following widget simulates state transitions across the pipeline based on adjustable calibration thresholds and sample input conditions:
+Bibliography & References
+   * OpenCode Agent Lifecycle & Tool Hooks Documentation: OpenCode Event Architecture
+   * Vercel Eve Auto-Approval Specification: Vercel Guide to Eve and Jev Guardrails
+   * TypeSafe Jev System One Specifications: TypeSafe AI System One Developer Guide
+   * Uncertainty Calibration in Decision Models: LangChain Harness & Calibration Methodology
+________________
+
+
+User prompt: 1. schema normalization is an interactive process that is finalized by the user. 2. a separate tuning flow is provided explicitly for the user to call(no details on this yet) 3. not sure how to mitigate this yet. maybe having a very high threshold of confidence for passing and falling back to user confirmation.
+Response: Revised Architecture Nuances
+   1. Interactive Schema Normalization
+   * Requiring explicit user finalization for the intent_manifest mitigates the risk of automated parsers hallucinating constraints or stripping edge-case requirements.
+   * Doubt: It is uncertain whether interactive prompt building creates friction or approval fatigue during rapid, iterative terminal sessions.
+   2. Dedicated User Tuning Flow
+   * Exposing an explicit tuning entry point allows jevcal parameters to adapt to specific codebases rather than forcing reliance on static global defaults.
+   * Doubt: It remains dubious how many execution samples or labeled evaluations are necessary before Jev probability distributions show statistically significant calibration gains.
+   3. High Confidence Thresholds with Human Fallback
+   * Routing intermediate tool executions with lower confidence (Palign​<0.98) to an interactive terminal prompt (Confirm tool execution? [y/N]) prevents hard false-positive blocks during multi-step refactoring passes.
+   * Doubt: Frequent fallback prompts risk causing confirmation fatigue, where users may passively approve proposed tool actions without reviewing the payload.
+References & Links
+   * Human Oversight & Agent Oversight Tax Analysis: ArXiv — Harness Choice as a Hidden Variable in Coding-Agent Evaluation
+   * OpenCode Tool Confirmation Primitives: GitHub — TencentCloudBase/openVibeCoding
+   * Human Approval Failure Modes in AI IDEs: DEV Community — OS-Level Sandboxing for AI Agents
+   * CodeMCP Jev Routing & User Approval Checks: Pi Package Index — pi-codemcp
+________________
+
+
+User prompt: The doubts are ok. re output the updated detailed system summary. the one before was preeth food
+Response:                                   ┌─────────────────────────────┐
+                                 │      Raw User Prompt        │
+                                 └──────────────┬──────────────┘
+                                                │
+                                                ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 1: INTERACTIVE SCHEMA NORMALIZATION ENGINE                                                 │
+│ - Parses unstructured text into a candidate JSON structure.                                      │
+│ - Developer interactively reviews & finalizes:                                                    │
+│   intent_manifest { action_type, target_scope, acceptance_criteria, non_goals }                  │
+└────────────────────────────────┬─────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ STAGE 2: PRE-EXECUTION GATE (jev-classifier + jevcal)                                           │
+│ 1. Jev.Choice ──► Classifies intent category.                                                    │
+│ 2. Jev.Noul   ──► Evaluates "Is scope fully specified and unambiguous?".                         │
+│ 3. jevcal     ──► Applies calibrated thresholds (fitted via separate user tuning flow).          │
+└────────────────┬─────────────────────────────────────────────────────────────────────────────────┘
+                │
+                ├──────────────────────────────┐
+                │ Decision Gate:               │
+                │ P_cal ≥ 0.92 AND             │
+                │ Category ≠ "out_of_bounds"?  │
+                └───────┬──────────────┬───────┘
+                        │              │
+                No (Fail)              Yes (Pass)
+                        │              │
+                        ▼              ▼
+       ┌──────────────────┐  ┌────────────────────────────────────────────────────────────────────┐
+       │ HALT EXECUTION   │  │ LOCK MANIFEST STATE                                                │
+       │ Fallback to User │  │ Persist `.opencode/state/locked_manifest.json`                     │
+       │ Clarification    │  └─────────────────────────────────┬──────────────────────────────────┘
+       └──────────────────┘                                    │
+                                                               ▼
+                             ┌────────────────────────────────────────────────────────────────────┐
+                             │ STAGE 3: OPENCODE SYSTEM 2 GENERATIVE LOOP                         │
+                             │ OpenCode proposes tool action T_i                                  │
+                             └─────────────────────────────────┬──────────────────────────────────┘
+                                                               │
+                                                               ▼
+                             ┌────────────────────────────────────────────────────────────────────┐
+                             │ EVE / JEV INTERCEPTOR HOOK (`tool.execute.before`)                 │
+                             │ Evaluates proposed command T_i against locked manifest via Jev    │
+                             └─────────────────────────────────┬──────────────────────────────────┘
+                                                               │
+                               ┌───────────────────────────────┼────────────────────────────────┐
+                               │ High-Confidence Gate          │ Borderline Gate                │
+                               │ (P_align ≥ 0.98)              │ (0.80 ≤ P_align < 0.98)        │
+                               └───────────────┬───────────────┴────────────────┬───────────────┘
+                                               │                                │
+                                               ▼                                ▼
+                               ┌───────────────────────────────┐┌───────────────────────────────┐
+                               │ AUTO-EXECUTE                  ││ INTERACTIVE FALLBACK PROMPT   │
+                               │ Run tool command T_i          ││ "Confirm execution? [y/N]"    │
+                               └───────────────────────────────┘└───────────────────────────────┘
+
+Revised Component Architecture
+1. Interactive Schema Normalization Engine (User-Finalized)
+   * Mechanic: Converts raw prompts into candidate JSON via CLI pre-flight prompts (gum/inquirer), requiring explicit human sign-off before committing to execution.
+   * Doubt: Whether interactive normalization imposes unacceptable human overhead ("approval fatigue") during rapid, single-line terminal tweaks remains uncertain.
+2. Pre-Execution Calibration Node (jev-classifier + jevcal)
+   * Mechanic: Evaluates the locked intent_manifest using System One parallel queries. A separate user tuning flow (invoked via jevcal CLI against project-specific evaluation pairs) fits custom thresholds to match repository conventions.
+   * Doubt: It is dubious whether small, team-specific labeled datasets contain enough variance for jevcal to fit robust thresholds without overfitting to past commits.
+3. In-Loop Trajectory Interceptor with User Fallback (eve + OpenCode Hook)
+   * Mechanic: Intercepts proposed commands (Ti​) via OpenCode's tool.execute.before hook.
+   * If alignment probability Palign​≥0.98, the tool auto-executes.
+   * If 0.80≤Palign​<0.98, execution pauses for interactive confirmation (Confirm tool execution? [y/N]).
+   * If Palign​<0.80, the tool action is hard-blocked.
+   * Doubt: Intermediate refactoring steps often temporarily break build invariants or modify adjacent files; set too strictly, human confirmation fallbacks may trigger constantly during standard multi-step edits.
+Bibliography & References
+   * TypeSafe Jev System One Specification: DevelopersDigest — TypeSafe Jev Architecture & Benchmarks (Sept 2026)
+   * jevcal Calibration CLI Reference: Awesome TypeSafe — Calibration & Thresholding
+   * Vercel Eve & Jev Tool Interception: Vercel — Auto-Approving Tool Calls in Eve with Jev
+   * Jev Ecosystem Overview: ScriptByAI — The Ultimate Jev Resource List 2026
+   * Decision Models vs LLMs: AI Fire — Cheapest LLM API? Meet Jev
+Sources
+   1. Awesome TypeSafe
+   2. TypeSafe Jev: the First Decision-Only Model Class, Benchmarked
+   3. Cheapest LLM API? Meet Jev, the AI Model Built for Code - AI Fire
+________________
+
+
+User prompt: Ok great, can all of this be inside opencode? 1. open opencode prompt 2. input text 3. interactive schema normalization 4. pre execution classifier 5. ...
+Response: Yes, the entire pipeline can be hosted natively within a single OpenCode process using OpenCode's TypeScript plugin lifecycle system (@opencode-ai/plugin residing in .opencode/plugins/).
+Native OpenCode Lifecycle Mapping
+
+
+Pipeline Phase
+	OpenCode Event / Lifecycle Hook
+	Mechanism Inside OpenCode
+	1. Input Text
+	chat.message
+	Intercepts incoming user input before it reaches the main LLM context.
+	2. Interactive Schema Normalization
+	chat.message + ctx.ask()
+	Extracts candidate JSON via Jev/LLM parser, then uses OpenCode's TUI modal (ctx.ask) to prompt the developer to finalize fields (target_scope, non_goals) directly in the terminal.
+	3. Pre-Execution Classifier & jevcal
+	chat.message
+	Evaluates normalized manifest with Jev. If calibrated probability Pcal​<0.92, cancels LLM dispatch and displays a clarification prompt in the TUI.
+	4. Locked Manifest Context
+	chat.message (Context Injection)
+	Upon passing Stage 3 (Pcal​≥0.92), writes .opencode/state/locked_manifest.json and injects non-goals into the LLM system prompt.
+	5. System 2 Execution Loop
+	Native OpenCode Prompt Engine
+	OpenCode reasoning LLM plans and proposes tool actions (Ti​).
+	6. Trajectory Interceptor
+	tool.execute.before
+	Intercepts every tool call (e.g., bash, edit_file) before execution. Evaluates Ti​ against locked_manifest.json using Jev.Noul.
+	7. Execution / Fallback
+	permission.ask
+	Auto-executes if Palign​≥0.98. If 0.80≤Palign​<0.98, delegates to permission.ask ([y/N] prompt in TUI). Hard-blocks tool if Palign​<0.80.
+	Implementation Architecture (.opencode/plugins/jev-guardrail.ts)
+import { Plugin } from "@opencode-ai/plugin";
+import { JevClient } from "@typesafe/jev";
+import { jevcal } from "jevcal";
+
+const jev = new JevClient({ apiKey: process.env.JEV_API_KEY });
+
+export const JevGuardrailPlugin: Plugin = async (ctx) => {
+ let lockedManifest: Record<string, any> | null = null;
+
+ return {
+   // Stage 1 - 3: Intercept Prompt & Interactive Normalization
+   "chat.message": async (input, output) => {
+     const rawPrompt = output.parts.find((p) => p.type === "text")?.text;
+     if (!rawPrompt) return;
+
+     // Extract preliminary candidate schema
+     const candidate = await jev.extractSchema(rawPrompt);
+
+     // Interactive TUI prompt inside OpenCode
+     const userApprovedScope = await ctx.ask({
+       question: "Confirm target scope for this task:",
+       default: candidate.target_scope.join(", "),
+     });
+
+     const manifest = {
+       ...candidate,
+       target_scope: userApprovedScope.split(",").map((s) => s.trim()),
+     };
+
+     // Pre-execution Jev evaluation
+     const res = await jev.evaluate({
+       state: manifest,
+       questions: {
+         is_unambiguous: {
+           type: "Noul",
+           statement: "The task scope and non-goals are completely unambiguous.",
+         },
+       },
+     });
+
+     const pCal = jevcal.calibrate(res.questions.is_unambiguous.probability);
+
+     if (pCal < 0.92) {
+       throw new Error(
+         `[JEV GUARDRAIL] Ambiguous intent detected (${(pCal * 100).toFixed(1)}%). Please refine non-goals or scope.`
+       );
+     }
+
+     // Stage 4: Lock state for session
+     lockedManifest = manifest;
+     await ctx.storage.set("locked_manifest", manifest);
+   },
+
+   // Stage 6 - 7: Intercept Tool Execution
+   "tool.execute.before": async (input, output) => {
+     if (!lockedManifest) return;
+
+     const proposedAction = { tool: input.tool, args: output.args };
+
+     const evalRes = await jev.evaluate({
+       state: { manifest: lockedManifest, proposedAction },
+       questions: {
+         aligns: {
+           type: "Noul",
+           statement: "Does this tool execution strictly align with locked target_scope and non_goals?",
+         },
+       },
+     });
+
+     const pAlign = evalRes.questions.aligns.probability;
+
+     if (pAlign < 0.80) {
+       throw new Error(`[JEV DRIFT BLOCKED] Action violates locked non-goals.`);
+     } else if (pAlign < 0.98) {
+       // Fallback to OpenCode permission prompt
+       const approved = await ctx.ask({
+         question: `[JEV BORDERLINE (${(pAlign * 100).toFixed(1)}%)] Approve '${input.tool}' execution?`,
+       });
+       if (!approved) throw new Error("User denied borderline tool execution.");
+     }
+   },
+ };
+};
+
+Operational Doubts & Technical Caveats
+   * Hook Dispatch Latency: There is significant doubt regarding whether async calls inside tool.execute.before introduce noticeable lag during large, fast multi-tool refactoring runs.
+   * TUI Input Blocking: It remains dubious whether nested ctx.ask modal interactions inside chat.message work reliably across all terminal multiplexer setups without breaking message context rendering.
+   * State Persistence Across Crashes: If the OpenCode process restarts mid-session, relying on in-memory lockedManifest state may fail unless explicitly backed by project-level disk storage (.opencode/state/locked_manifest.json).
+References & Links
+   * OpenCode Plugin API & Hooks Manual: OpenCode Plugins Development Guide
+   * OpenCode Plugin Event Hooks Reference: GitHub — joshuadavidthomas/opencode-plugins-manual
+   * Vercel Eve & Jev Guardrail Patterns: Vercel Guide to Auto-Approving Tool Calls in Eve with Jev
+   * TypeSafe Jev System One Specifications: TypeSafe AI System One Developer Specs
+Sources
+   1. opencode-plugin-development | Skills... - LobeHub
+   2. Overview | OpenCode
+________________
+
+
+User prompt: Great and also the classification tuning in a separate flow
+Response: The separate classification tuning flow can be integrated natively into OpenCode as an explicit Slash Command (/jev-tune) and a dedicated Tuning Plugin Tool (.opencode/plugins/jev-tuning.ts).
+This allows you to run calibration passes on local repository traces without leaving the OpenCode TUI.
+Step 1: Define the Slash Command (.opencode/commands/jev-tune.md)
+Create a custom slash command definition in your project directory:
+---
+description: Interactively tune jevcal calibration thresholds using local execution traces
+agent: build
+---
+Extract recorded execution traces from `.opencode/state/traces.json`, evaluate borderline predictions, and optimize the local `jevcal` calibration curve.
+
+When you type /jev-tune inside the OpenCode TUI, OpenCode triggers the associated tuning plugin logic in the current session context.
+Step 2: Implement the Tuning Plugin (.opencode/plugins/jev-tuning.ts)
+The tuning plugin reads execution traces captured by the guardrail during prior sessions, presents borderline tool calls to the user for interactive labeling, and updates project calibration parameters.
+import { Plugin } from "@opencode-ai/plugin";
+import { JevClient } from "@typesafe/jev";
+import { jevcal } from "jevcal";
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const jev = new JevClient({ apiKey: process.env.JEV_API_KEY });
+
+export const JevTuningPlugin: Plugin = async (ctx) => {
+ const tracePath = path.join(ctx.location.directory, ".opencode/state/traces.json");
+ const configPath = path.join(ctx.location.directory, ".opencode/state/jevcal_config.json");
+
+ return {
+   // Expose /jev-tune as an explicit command/tool
+   tool: {
+     "jev_tune": {
+       description: "Run interactive calibration pass over saved session traces",
+       args: {},
+       async execute(args, context) {
+         // 1. Load recorded traces from disk
+         const rawData = await fs.readFile(tracePath, "utf-8").catch(() => "[]");
+         const traces = JSON.parse(rawData);
+
+         if (traces.length === 0) {
+           return "No execution traces found. Run a few guarded OpenCode sessions first.";
+         }
+
+         const dataset: Array<{ rawProb: number; label: 0 | 1 }> = [];
+
+         // 2. Interactive labeling of borderline or uncalibrated traces
+         for (const trace of traces.slice(-15)) { // Review last 15 traces
+           const answer = await ctx.ask({
+             question: `Was action '${trace.action}' on '${trace.target}' aligned with intent? (y/n)`,
+           });
+
+           dataset.push({
+             rawProb: trace.rawProbability,
+             label: answer.trim().toLowerCase() === "y" ? 1 : 0,
+           });
+         }
+
+         // 3. Fit new calibration curve using jevcal
+         const fittedParams = jevcal.fit(dataset);
+
+         // 4. Persist updated configuration for the primary guardrail plugin
+         await fs.mkdir(path.dirname(configPath), { recursive: true });
+         await fs.writeFile(configPath, JSON.stringify(fittedParams, null, 2));
+
+         return `[JEV TUNING COMPLETE] Saved updated calibration parameters to .opencode/state/jevcal_config.json (Optimal threshold: ${fittedParams.optimalThreshold}).`;
+       },
+     },
+   },
+ };
+};
+
+Step 3: Hot-Reloading Calibration in the Main Guardrail
+The primary guardrail plugin (.opencode/plugins/jev-guardrail.ts) dynamically reloads .opencode/state/jevcal_config.json before performing evaluation passes:
+// Inside .opencode/plugins/jev-guardrail.ts
+async function getCalibratedThreshold(rawProb: number, projectDir: string): Promise<number> {
+ try {
+   const configRaw = await fs.readFile(`${projectDir}/.opencode/state/jevcal_config.json`, "utf-8");
+   const config = JSON.parse(configRaw);
+   return jevcal.calibrate(rawProb, config);
+ } catch {
+   // Fallback to uncalibrated raw probability if no project tuning file exists
+   return rawProb;
+ }
+}
+
+Complete Native OpenCode Architecture
+─────────────────────────────────────────────────────────────────────────────────────────
+NORMAL EXECUTION LOOP                                 SEPARATE TUNING FLOW
+─────────────────────────────────────────────────────────────────────────────────────────
+1. User Input Prompt                                   1. User types `/jev-tune`
+       │                                                      │
+       ▼                                                      ▼
+2. `chat.message` Interceptor                         2. `jev_tune` Custom Tool
+   - `ctx.ask()` for Manifest Sign-off                   - Reads `.opencode/state/traces.json`
+   - Jev.Noul Evaluation                                      │
+   - Calibrate via `jevcal_config.json`                       ▼
+       │                                              3. Interactive Labeling
+       ▼                                                 - `ctx.ask()` for (y/n) feedback
+3. OpenCode System 2 Generative Loop                          │
+   - Proposes Tool Action T_i                                 ▼
+       │                                              4. `jevcal.fit(dataset)`
+       ▼                                                 - Fits logistic/isotonic curve
+4. `tool.execute.before` Hook                                 │
+   - Logs (P_raw, T_i) ──► append ──► [ traces.json ]         ▼
+   - If P_cal < 0.80 ──► Block                         5. Write `.opencode/state/jevcal_config.json`
+   - If 0.80 ≤ P_cal < 0.98 ──► `ctx.ask()`                    │
+   - If P_cal ≥ 0.98 ──► Auto-Execute                           └───────(Hot-Reloaded)─────────► [Guardrail]
+─────────────────────────────────────────────────────────────────────────────────────────
+
+Interactive Calibration Fitting Simulator
+This widget simulates how jevcal.fit() recalculates the probability threshold curve based on interactive user feedback labels:
+Operational Doubts & Technical Caveats
+   * Dataset Sparsity: It is doubtful whether labeling fewer than 20–30 local trace samples will yield statistically meaningful calibration curves in jevcal.fit().
+   * Trace Log Storage Overhead: Storing full tool parameters and high-dimensional prompt states in .opencode/state/traces.json may result in significant local disk growth over extended coding sessions unless truncation/rotation policies are enforced.
+   * Overfitting to Historical Scenarios: It remains uncertain whether calibration parameters tuned on historical bug-fix commits will generalize accurately to newly introduced feature refactoring tasks in the same codebase.
+References & Links
+   * OpenCode Slash Commands Documentation: OpenCode Commands Specification
+   * OpenCode Plugin Lifecycle & Tools API: OpenCode Plugin Development Guide
+   * Vercel Eve & Jev Guardrail Tooling: Vercel Guide to Auto-Approving Tool Calls in Eve with Jev
+   * Probability Calibration Methodology: LangChain Blog — Harnessing Jev System One Models
+Sources
+   1. Commands | OpenCode
+________________
+
+
+User prompt: Very well can the workflow integrate with openspec mode of operation orr will they clash
+Response: They do not inherently clash, but without explicit integration rules, there is a strong likelihood of structural friction between Jev's runtime interceptor and OpenSpec's spec-driven workflow.
+Rather than running as competing systems, OpenSpec artifacts (spec.md, tasks.md, proposals/) can directly replace Jev's Stage 1 interactive schema normalization. However, significant operational doubts remain regarding their combined execution.
+Integration Alignment vs. Points of Friction
+
+
+Workflow Stage
+	OpenSpec Native Role
+	Jev Guardrail Role
+	Integration / Potential Clash
+	Intent Definition
+	Human/Agent drafts .openspec/ artifacts (spec.md, tasks.md).
+	Generates intent_manifest.json via interactive TUI prompt.
+	Synergistic: OpenSpec replaces Jev schema normalization entirely. The OpenSpec spec.md becomes the source of truth for Palign​ evaluations.
+	Meta-Tool Operations
+	Agent writes/modifies spec files (e.g., .openspec/tasks.md).
+	Intercepts write_file / edit_file via tool.execute.before.
+	Clash Risk: Jev may evaluate spec-maintenance tool calls as out-of-scope intent drift (Palign​<0.80) if meta-files are not explicitly whitelisted.
+	Task Progression
+	Agent steps through sequential tasks in tasks.md.
+	Evaluates proposed tool actions Ti​ against a static locked_manifest.json.
+	Clash Risk: If OpenSpec transitions tasks dynamically but Jev holds a static manifest snapshot, Jev will falsely block valid tool calls for downstream tasks.
+	Human Supervision
+	User reviews and approves OpenSpec task proposals.
+	ctx.ask() prompts for borderline executions (0.80≤Palign​<0.98).
+	Friction Risk: Stacking OpenSpec's manual task reviews on top of Jev's fallback prompts creates severe approval fatigue.
+	Substantial Operational Doubts
+   * Redundancy of Guardrails: It remains dubious whether adding Jev's probability evaluation (Palign​) provides any measurable error reduction over OpenSpec's native spec-validation passes, given that OpenSpec already constrains agent context using explicit markdown specifications.
+   * Meta-File Misclassification: There is substantial doubt regarding whether Jev's Noul primitive can reliably distinguish between an agent modifying codebase files (which must match target_scope) and updating internal .openspec/ state tracking files without triggering false-positive blocks.
+   * Context Stale-State Hazards: It is uncertain how Jev handles iterative spec edits mid-session. If an OpenSpec task is modified during execution, re-synchronizing Jev's locked_manifest in memory without race conditions across OpenCode hooks remains unproven.
+Recommended Architecture Adjustments
+To prevent the systems from clashing, the OpenCode plugin must treat OpenSpec state changes as first-class triggers:
+   1. Disable Jev Stage 1 Normalization: Pass OpenSpec's active tasks.md payload directly to Jev as the locked manifest upon command invocation.
+   2. Whitelist OpenSpec Paths: Explicitly skip Jev P_align evaluation for tool operations targeting .openspec/* or .opencode/* directories.
+   3. Dynamic Task Binding: Update Jev's evaluation scope on every OpenSpec task transition (task.start event) rather than locking a single immutable manifest for the entire session.
+References & Bibliography
+   * OpenSpec Architecture & Specification: OpenSpec Specification & Speckit Guides
+   * OpenCode Event Hooks & Plugin Lifecycle: OpenCode Plugins Manual — Hooks Reference
+   * System One Guardrail Overhead in Agentic Workflows: ArXiv — Harness Choice as a Hidden Variable in Coding-Agent Evaluation
+   * Vercel Eve Tool Approvals & Context Interception: Vercel — Auto-Approving Tool Calls in Eve with Jev
+   * TypeSafe Jev System One Specifications: TypeSafe AI System One Developer Specs
+________________
+
+
+User prompt: Intent definition: the schema should be a the primary source for intent, the openspec spec should be a supporting document. meta tool ops: jev should not witelist files if they drift from intent they should be flagged. 3 there should be a project schema manifest and a schema manifest per each call
+Response: Revised Multi-Tier Architecture & OpenSpec Integration
+By establishing the Schema as the primary intent authority and OpenSpec as a supporting document, the guardrail eliminates reliance on file paths while enforcing hierarchical boundaries across session life-cycles.
+Intent Hierarchy & Manifest Mechanics
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│ PRIMARY INTENT AUTHORITY (Schema Manifests)                                            │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Project Schema Manifest (`project_manifest.json`)                                 │  │
+│  │ - Session/repo invariants, strict non-goals, forbidden paths, architectural rules │  │
+│  └─────────────────────────────────────────┬─────────────────────────────────────────┘  │
+│                                            │ (Inherited & Bound)                        │
+│                                            ▼                                            │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Call-Level Schema Manifest (`call_manifest.json`)                                 │  │
+│  │ - Immediate task action, target target_scope, turn acceptance criteria             │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────┬────────────────────────────────────────────┘
+                                            │ Evaluated Against
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│ SUPPORTING CONTEXT                                                                      │
+│ - OpenSpec Documents (`spec.md`, `tasks.md`, `proposals/`)                              │
+│   (Provides contextual background for Jev reasoning; cannot override Schema constraints) │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+
+1. Dual-Manifest Hierarchy
+   * Project Schema Manifest (project_manifest.json): Persisted at the root (.opencode/state/project_manifest.json). Defines global project invariants, persistent non-goals, and immutable domain boundaries.
+   * Call-Level Schema Manifest (call_manifest.json): Created or updated per prompt turn or task execution. Captures transient task objectives and localized file targets for the current action.
+2. Supporting Role of OpenSpec
+   * OpenSpec artifacts (spec.md, tasks.md) are appended to Jev's evaluation payload purely as supplementary context.
+   * If a conflict occurs between an OpenSpec task statement and the project_manifest non-goals, the Primary Schema Manifest takes precedence, and Jev flags the evaluation as a violation.
+3. Strict Meta-Tool Evaluation (No Whitelisting)
+   * All meta-tool operations—including writes to .openspec/*, .opencode/*, or configuration files—are subjected to Jev trajectory evaluation.
+   * If an agent attempts to edit spec.md or tasks.md in a way that shifts architectural constraints or breaks non-goals defined in project_manifest.json, Jev flags the tool call as intent drift (Palign​<0.80) and blocks execution.
+Plugin Evaluation Logic (.opencode/plugins/jev-hierarchical-guardrail.ts)
+import { Plugin } from "@opencode-ai/plugin";
+import { JevClient } from "@typesafe/jev";
+import * as fs from "fs/promises";
+import * as path from "path";
+
+const jev = new JevClient({ apiKey: process.env.JEV_API_KEY });
+
+export const JevHierarchicalGuardrailPlugin: Plugin = async (ctx) => {
+ const projectManifestPath = path.join(ctx.location.directory, ".opencode/state/project_manifest.json");
+
+ return {
+   // Intercept tool actions (both meta-tools and code edits)
+   "tool.execute.before": async (input, output) => {
+     // 1. Load Primary Intent Authorities
+     const projectManifest = JSON.parse(await fs.readFile(projectManifestPath, "utf-8").catch(() => "{}"));
+     const callManifest = await ctx.storage.get("call_manifest") || {};
+
+     // 2. Load Supporting OpenSpec Context (if available)
+     const specContext = await fs.readFile(path.join(ctx.location.directory, ".openspec/spec.md"), "utf-8").catch(() => "");
+
+     const proposedAction = {
+       tool: input.tool,
+       args: output.args,
+     };
+
+     // 3. Evaluate Dual-Manifest Alignment via Jev
+     const evalRes = await jev.evaluate({
+       state: {
+         primary_authority: {
+           project_manifest: projectManifest,
+           call_manifest: callManifest,
+         },
+         supporting_context: {
+           openspec: specContext,
+         },
+         proposed_action: proposedAction,
+       },
+       questions: {
+         aligns_hierarchical: {
+           type: "Noul",
+           statement: 
+             "Does the proposed action (including edits to meta/spec files) strictly comply with call_manifest " +
+             "WITHOUT violating any non-goals or invariants in project_manifest?",
+         },
+       },
+     });
+
+     const pAlign = evalRes.questions.aligns_hierarchical.probability;
+
+     // 4. Decision Gates
+     if (pAlign < 0.80) {
+       throw new Error(
+         `[INTENT DRIFT DETECTED] Tool action '${input.tool}' on '${JSON.stringify(output.args)}' ` +
+         `violates Primary Schema Manifest constraints (P_align = ${(pAlign * 100).toFixed(1)}%).`
+       );
+     } else if (pAlign < 0.98) {
+       const approved = await ctx.ask({
+         question: `[BORDERLINE ACTION (${(pAlign * 100).toFixed(1)}%)] Approve '${input.tool}' on '${JSON.stringify(output.args)}'?`,
+       });
+       if (!approved) throw new Error("User rejected borderline action.");
+     }
+   },
+ };
+};
+
+Substantial Operational Doubts & Vulnerabilities
+   * Call-Manifest Escalation Attacks: If the System 2 agent is granted permission to generate or alter its own call_manifest.json during execution, it could manipulate localized task goals to bypass global project_manifest constraints unless Jev explicitly verifies write-isolation on manifest stores.
+   * Context Ceiling & Token Overhead: Feeding project_manifest, call_manifest, OpenSpec markdown files, and tool arguments into Jev simultaneously on every tool call increases input payload size. This risks exceeding System One token ceilings (32,768 to 64,000 tokens) on large repositories.
+   * Evaluation Latency Spikes: Running multi-document Jev Noul evaluations on fast, rapid-fire meta-tool executions (e.g., sequential write_file calls during spec generation) may introduce cumulative latency in terminal workflows.
+References & Links
+   * OpenCode Plugin Hooks Manual: OpenCode Plugins Event Reference
+   * OpenSpec Framework Guidelines: OpenSpec Specification & Tooling
+   * TypeSafe Jev System One Specifications: TypeSafe AI System One Developer Specs
+   * Vercel Eve Auto-Approval Guardrails: Vercel Guide to Eve and Jev Tool Interception
+________________
+
+
+User prompt: Can this be something that is standalone but also pluggable into openspec
+Response: Yes, designing the Jev Guardrail as a decoupled core library allows it to run as a standalone CLI or daemon while simultaneously plugging into OpenSpec, OpenCode, or Model Context Protocol (MCP) harnesses via lightweight adapter bridges.
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             STANDALONE CORE ENGINE                               │
+│                                (`@jev-guard/core`)                               │
+│ - Primary Schema Manifest Resolver (`project_manifest.json` & `call_manifest`) │
+│ - Jev API Evaluator & `jevcal` Calibration Curve Handler                         │
+│ - Trace Logger & Local Tuning State (`.jev/traces.json`, `jevcal_config.json`)   │
+└────────┬───────────────────────────────┬────────────────────────────────┬────────┘
+        │                               │                                │
+        ▼                               ▼                                ▼
+┌─────────────────┐             ┌─────────────────┐             ┌──────────────────┐
+│ Standalone CLI  │             │ OpenSpec        │             │ OpenCode / MCP   │
+│ (`jev-guard`)   │             │ Integration     │             │ Plugin Bridge    │
+│ - Pre-commit    │             │ - Task Listener │             │ - Lifecycle      │
+│ - CI/CD Pipelines│            │ - Spec Context  │             │   Hooks          │
+│ - Manual Shell  │             │   Injector      │             │ - TUI `ctx.ask`  │
+└─────────────────┘             └─────────────────┘             └──────────────────┘
+
+1. The Standalone Core Engine (@jev-guard/core)
+The core package exposes pure, harness-agnostic functions that have no dependencies on OpenCode, OpenSpec, or any specific editor environment:
+// @jev-guard/core
+export class JevGuardEngine {
+ constructor(private config: JevGuardConfig) {}
+
+ // Validates a call-level manifest against project invariants
+ async validateCallManifest(
+   projectManifest: ProjectManifest, 
+   callManifest: CallManifest
+ ): Promise<ManifestValidationResult>;
+
+ // Evaluates a proposed tool action against primary manifests and optional supporting context
+ async evaluateAction(
+   action: ProposedAction,
+   primary: { project: ProjectManifest; call: CallManifest },
+   supportingContext?: { openspec?: string; [key: string]: any }
+ ): Promise<ActionEvaluationResult>;
+}
+
+Standalone CLI Driver (jev-guard)
+This allows running the guardrail independently in scripts, git pre-commit hooks, or non-OpenCode terminal workflows:
+# Initialize standalone project manifest
+jev-guard init
+
+# Manually evaluate a proposed action in terminal
+jev-guard eval --tool edit_file --args '{"path": "src/auth.ts"}'
+
+# Run calibration tuning flow standalone
+jev-guard tune
+
+2. Pluggable OpenSpec Integration (@jev-guard/openspec-adapter)
+To integrate with OpenSpec without tight coupling, an adapter binds OpenSpec's task lifecycle events to the core engine:
+   1. Context Extraction: When an OpenSpec command or task starts (openspec run or task transition), the adapter reads .openspec/spec.md and active .openspec/tasks.md.
+   2. Context Passing: The adapter injects the OpenSpec markdown into supportingContext.openspec while keeping project_manifest.json and call_manifest.json as the primary evaluation authority.
+   3. Spec Integrity Check: When OpenSpec agent tools attempt to edit spec files, the adapter routes the edit through evaluateAction(). If the proposed spec change strays from project_manifest.json invariants, Jev blocks the write.
+// @jev-guard/openspec-adapter
+import { JevGuardEngine } from "@jev-guard/core";
+
+export function createOpenSpecGuardMiddleware(engine: JevGuardEngine) {
+ return async (openspecContext: any, next: Function) => {
+   // 1. Read current OpenSpec state as supporting context
+   const specDoc = await openspecContext.readSpec();
+   const activeTask = await openspecContext.getActiveTask();
+
+   // 2. Resolve Primary Call Manifest for current task
+   const callManifest = {
+     action_type: activeTask.type,
+     target_scope: activeTask.scope,
+     acceptance_criteria: activeTask.criteria
+   };
+
+   // 3. Attach engine evaluation to OpenSpec tool execution phase
+   openspecContext.onToolExecute(async (action: any) => {
+     const result = await engine.evaluateAction(
+       action,
+       { project: openspecContext.projectManifest, call: callManifest },
+       { openspec: specDoc }
+     );
+
+     if (result.pAlign < 0.80) {
+       throw new Error(`[OPENSPEC GUARD] Action violates Primary Schema Manifest.`);
+     }
+   });
+
+   return next();
+ };
+}
+
+3. OpenCode & MCP Plugins (Consumer Bridges)
+With the core engine decoupled, host integrations become tiny wrapper plugins:
+   * OpenCode Plugin (.opencode/plugins/jev.ts): Imports @jev-guard/core and @jev-guard/openspec-adapter, binding chat.message and tool.execute.before events directly to the engine methods.
+   * MCP Server (jev-mcp-server): Exposes @jev-guard/core as a standard Model Context Protocol stdio server for use in Claude Code, Cursor, or Goose.
+Substantial Operational Doubts
+   * Schema Translation Drift: Translating OpenSpec markdown tasks into structured call_manifest objects automatically via adapters without user sign-off may introduce subtle intent mismatches.
+   * State Synchronization Overhead: If a user edits an OpenSpec task file manually while standalone jev-guard is running in another terminal window, keeping in-memory manifest states synchronized requires active file-system watches on .openspec/ and .jev/.
+   * Multi-Adapter Maintenance: Maintaining separate bridge packages for OpenSpec, OpenCode, and standalone CLI increases surface area for version incompatibility as Jev System One specs evolve.
+References & Links
+   * TypeSafe Jev System One Specification: TypeSafe AI System One Developer Specs
+   * OpenSpec Architecture Documentation: OpenSpec Specification & Tooling
+   * OpenCode Plugins API Reference: OpenCode Plugin Development Guide
+   * Model Context Protocol (MCP) Specification: Model Context Protocol Specification
+________________

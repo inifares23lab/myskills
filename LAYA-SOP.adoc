@@ -1,0 +1,210 @@
+= Laya Intent Gate — Standard Operating Procedure
+
+Companion documents: xref:LAYA-RESEARCH.md[research report] · xref:LAYA.md[original brief]
+Tool: `laya_gate.py` (repo root) · Model: `convaiinnovations/laya` (421M, Apache-2.0)
+
+== 1. Purpose
+
+Gate every prompt before it reaches a generative coding agent (OpenCode or
+otherwise). Laya classifies the request and scores its ambiguity in a single
+forward pass (~40 ms GPU / ~200–500 ms CPU). Ambiguous or out-of-scope prompts
+halt for human clarification instead of drifting into the wrong change.
+
+== 2. Prerequisites
+
+[cols="2,3"]
+|===
+| Item | Requirement
+
+| Python
+| ≥ 3.10 (verified on 3.14)
+
+| Virtual env
+| `~/.venvs/laya` with `laya>=0.1.6`, `transformers>=4.48.0`, `torch` (CUDA optional)
+
+| Model
+| Auto-downloads on first load (~846 MB, cached in `~/.cache/huggingface`)
+
+| GPU
+| Optional. ≥ 2 GB VRAM for inference; CPU-only works
+|===
+
+== 3. One-time setup
+
+[source,bash]
+----
+python3 -m venv ~/.venvs/laya
+source ~/.venvs/laya/bin/activate
+export USE_TF=0     # prevents a transformers/TF import deadlock
+pip install -U "laya>=0.1.6" "transformers>=4.48.0" safetensors huggingface_hub
+----
+
+Verify the install with the self-check (two canned prompts: one must PROCEED,
+one must CLARIFY):
+
+[source,bash]
+----
+python laya_gate.py --demo
+----
+
+== 4. Operating the gate
+
+[source,bash]
+----
+python laya_gate.py "Replace JWT verification in src/auth.ts with HMAC session checks" \
+    --scope src/auth.ts \
+    --non-goal "DB schema" \
+    --non-goal "user routes"
+----
+
+[cols="1,2,3"]
+|===
+| Flag | Repeatable | Meaning
+
+| `"<prompt>"`
+| no
+| The raw user request (free text)
+
+| `--scope`
+| yes
+| Explicit target paths; recorded in the manifest
+
+| `--non-goal`
+| yes
+| Explicit exclusions; recorded in the manifest
+|===
+
+=== 4.1 Reading the output
+
+Exit code carries the decision for scripting:
+
+* *Exit 0 — PROCEED*: stdout is the JSON `intent_manifest` (action, scope,
+  non-goals, Laya sub-scores). Lock it as the session invariant.
+* *Exit 1 — CLARIFY*: stdout carries a `reason`. Do **not** hand the prompt to
+  the agent; ask the user for exact files / a verifiable outcome first.
+
+Sample PROCEED manifest (abridged):
+
+[source,json]
+----
+{
+  "status": "PROCEED",
+  "manifest": {
+    "action": "refactor",
+    "target_scope": ["src/auth.ts"],
+    "non_goals": ["DB schema"],
+    "laya": { "db_schema_touched": 0.43, "destructive": 0.02 }
+  }
+}
+----
+
+=== 4.2 Decision rules (in the script)
+
+[cols="2,2,2"]
+|===
+| Check | Threshold | Effect
+
+| `change_type == out_of_scope`
+| —
+| CLARIFY
+
+| `scope_unambiguous` (noul)
+| < 0.92
+| CLARIFY with reason
+
+| `destructive` (noul)
+| > 0.80
+| PROCEED + `requires_confirmation: true`
+
+| otherwise
+| —
+| PROCEED
+|===
+
+WARNING: 0.92 is borrowed from the Jev integration notes, not measured on this
+checkpoint. Log real prompts for a week, then re-derive the threshold from the
+score distribution before trusting it in automation.
+
+== 5. Interpreting model output
+
+* Trust the *argmax choice* and the *probability shape* over the `confidence`
+  number. The checkpoint ships some temperatures outside the trustable range —
+  at load you may see `RuntimeWarning: ... clamping choice:11+=0.1006`; any
+  bucket named there has uncalibrated confidence until you refit (§7).
+* `action.act_probability` comes from the act/escalate head; 1.0 is normal for
+  well-formed requests.
+* The English checkpoint collapses on non-English input while staying
+  confident. For non-English traffic switch to the `multilingual` subfolder —
+  do not rely on confidence gating to catch it.
+* `score` questions return a position between levels (e.g. `1.02` = mostly
+  "one module"); read the `legend` and `probabilities`, not just the number.
+
+== 6. Troubleshooting
+
+[cols="2,3"]
+|===
+| Symptom | Fix
+
+| Load hangs at import
+| `export USE_TF=0` (TF/abseil deadlock)
+
+| First call slow
+| Model download (~846 MB); subsequent loads are cache hits
+
+| CUDA OOM
+| Inference needs < 1.5 GB; free VRAM or drop to CPU — accuracy is identical
+
+| Triton `_POSIX_C_SOURCE` warnings
+| Harmless compiler noise; ignore
+
+| HF rate-limit warning
+| Optional: `huggingface-cli login` or set `HF_TOKEN`
+
+| Confidence looks off
+| Expected — see §5; refit temperatures per §7
+|===
+
+== 7. Calibration refit (when probabilities start mattering)
+
+Before any automated thresholding on confidence values:
+
+. Log `(state, questions, gold)` tuples from real gate usage (≥ 100 per question type).
+. Fit one temperature per question type on the held-out logits (LBFGS on
+  log-softmax cross-entropy — reference implementation in the
+  https://github.com/NandhaKishorM/laya/blob/main/notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb[official notebook]).
+. Write the fitted values into `rl_agent_config.json` / pass at load time.
+
+Expected effect: mean ECE drops from ~0.47 to ~0.08 on the reference checkpoint.
+
+== 8. Fine-tuning path (specialising the gate)
+
+Full-parameter RLCD does not fit 4 GB VRAM. Do not attempt it locally.
+
+. Run the official notebook as-is on **Kaggle 2×T4** (free, internet on): ~4–6 min.
+. Data: ≥ a few hundred labelled cases per workflow; 1,200 cases → 6,000
+  decisions sufficed for the reference checkpoint. Format: `{state, questions,
+  gold}` with *soft* target distributions (§4.1 of the research report).
+. Download the resulting checkpoint, point `laya.load()` at it, keep thresholds.
+. Validate on held-out cases only: argmax accuracy (beat the majority-class
+  baseline), ECE (< 0.15 after refit), and one workflow you never trained on.
+
+Head-only or LoRA experiments *do* fit 4 GB (§5.1 of the research report) —
+freeze the encoder, train the decision head, micro-batch 1–2, gradient
+checkpointing on.
+
+== 9. Known limits
+
+* 512-token state budget (192 option + ~320 state tokens on the English
+  checkpoint) — long specs are silently truncated; chunk them.
+* Keep `choice` questions under ~20 options; beyond that use a two-step
+  coarse-to-fine choice or Jev (supports 255).
+* `score` is the weakest primitive; prefer `choice`/`noul` for gates.
+* Laya checks *conformance*, not *reasoning* — deep review stays with the
+  generative model; Laya gates it.
+
+== 10. References
+
+* link:https://huggingface.co/convaiinnovations/laya[model card]
+* link:https://github.com/NandhaKishorM/laya/blob/main/BENCHMARKS.md[official benchmarks]
+* link:https://pypi.org/project/laya/[PyPI: laya]
+* xref:LAYA-RESEARCH.md[full research report] — architecture, benchmark tables, integration designs
